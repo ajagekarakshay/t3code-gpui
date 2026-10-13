@@ -49,16 +49,23 @@ async fn durable_dispatch_runs_acp_permissions_cancellation_and_native_resume() 
         server.thread("thread")?["thread"]["pendingAcpPermission"]["id"],
         id
     );
-    server
-        .answer_permission("thread", id, Some("deny".into()))
+    let permission_result = server
+        .dispatch(json!({"type":"runtime-request.respond","commandId":"permission-response","threadId":"thread","requestId":id,"decision":"decline"}))
         .await?;
+    assert_eq!(permission_result["commandId"], "permission-response");
     milestone(&mut events, "acp.turn.finished").await?;
     let snapshot = server.thread("thread")?;
     assert_eq!(snapshot["messages"][3]["text"], "deny");
     assert!(snapshot["thread"]["pendingAcpPermission"].is_null());
     server.dispatch(json!({"type":"message.dispatch","commandId":"wait","threadId":"thread","messageId":"wait","text":"wait","attachments":[]})).await?;
     milestone(&mut events, "acp.update").await?;
-    server.cancel("thread").await?;
+    let run_id = server.thread("thread")?["thread"]["activeRunId"]
+        .as_str()
+        .context("Active run ID")?
+        .to_owned();
+    let interrupt = json!({"type":"run.interrupt","commandId":"interrupt","threadId":"thread","runId":run_id,"holdQueue":true});
+    let interrupt_result = server.dispatch(interrupt.clone()).await?;
+    assert_eq!(server.dispatch(interrupt).await?, interrupt_result);
     let cancelled = milestone(&mut events, "acp.turn.finished").await?;
     assert_eq!(cancelled["agentEvent"]["data"]["stopReason"], "cancelled");
     server.shutdown().await;

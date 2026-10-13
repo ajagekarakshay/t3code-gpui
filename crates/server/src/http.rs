@@ -50,6 +50,7 @@ impl ServerOptions {
 
 pub(crate) struct Services {
     _home_lock: std::fs::File,
+    pub(crate) home: PathBuf,
     pub(crate) store: Store,
     pub(crate) agents: BTreeMap<String, AgentCommand>,
     pub(crate) sessions: Mutex<HashMap<String, AgentSession>>,
@@ -97,11 +98,12 @@ impl Server {
             _ => "other",
         };
         // Do not advertise full V2 parity while the Rust projections are being ported.
-        let descriptor = json!({"environmentId":id,"label":options.label,"platform":{"os":os,"arch":arch},"serverVersion":env!("CARGO_PKG_VERSION"),"capabilities":{"repositoryIdentity":false},"rustMigration":true});
+        let descriptor = json!({"environmentId":id,"label":options.label,"platform":{"os":os,"arch":arch},"serverVersion":env!("CARGO_PKG_VERSION"),"orchestrationProtocolVersion":2,"capabilities":{"repositoryIdentity":false},"rustMigration":true});
         let (changes, _) = broadcast::channel(256);
         Ok(Self {
             services: Arc::new(Services {
                 _home_lock: home_lock,
+                home: home.clone(),
                 store,
                 agents: options.agents,
                 sessions: Mutex::default(),
@@ -124,6 +126,7 @@ impl Server {
             .route("/api/auth/websocket-ticket", post(ticket))
             .route("/api/auth/pairing-token", post(pair))
             .route("/api/orchestration/shell", get(shell))
+            .route("/api/orchestration/threads/{id}", get(compatible_thread))
             .route("/api/rust/threads/{id}", get(thread))
             .route("/api/projects", get(projects))
             .route("/api/projects/mutate", post(dispatch))
@@ -216,7 +219,8 @@ impl Server {
         id: &str,
         option: Option<String>,
     ) -> Result<()> {
-        self.services.answer_permission(thread, id, option).await
+        self.services.answer_permission(thread, id, option).await?;
+        Ok(())
     }
     pub async fn start_connect(&self, address: std::net::SocketAddr) -> Result<()> {
         self.services.start_connect(address).await
@@ -312,6 +316,67 @@ impl IntoResponse for ApiError {
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
+fn server_auth_descriptor() -> Value {
+    json!({
+        "policy":"remote-reachable",
+        "bootstrapMethods":["desktop-bootstrap","one-time-token"],
+        "sessionMethods":["bearer-access-token","dpop-access-token"],
+        "sessionCookieName":"t3-session",
+        "serverUpdateScope":"environment:maintain"
+    })
+}
+
+impl Services {
+    fn server_config(&self) -> Result<Value> {
+        let checked_at = crate::store::now();
+        let providers = self
+            .agents
+            .keys()
+            .map(|instance_id| {
+                let (driver, display_name) = if instance_id == "claude-code" {
+                    ("claude-agent", "Claude Code")
+                } else {
+                    (instance_id.as_str(), "Codex")
+                };
+                json!({
+                    "instanceId":instance_id,
+                    "driver":driver,
+                    "displayName":display_name,
+                    "supportedRuntimeModes":["full-access"],
+                    "enabled":true,
+                    "installed":true,
+                    "version":null,
+                    "status":"ready",
+                    "auth":{"status":"unknown"},
+                    "checkedAt":checked_at,
+                    "models":[{"slug":"default","name":"Default","isCustom":false,"isDefault":true,"capabilities":null}],
+                    "slashCommands":[],
+                    "skills":[]
+                })
+            })
+            .collect::<Vec<_>>();
+        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        Ok(json!({
+            "environment":self.descriptor,
+            "auth":server_auth_descriptor(),
+            "cwd":cwd,
+            "keybindingsConfigPath":self.home.join("keybindings.json").to_string_lossy(),
+            "keybindings":[],
+            "issues":[],
+            "providers":providers,
+            "availableEditors":[],
+            "observability":{
+                "logsDirectoryPath":self.home.join("logs").to_string_lossy(),
+                "localTracingEnabled":false,
+                "otlpTracesEnabled":false,
+                "otlpMetricsEnabled":false,
+                "otlpLogsEnabled":false
+            },
+            "settings":{}
+        }))
+    }
+}
+
 fn request_url(headers: &HeaderMap, uri: &Uri) -> Result<String> {
     let host = headers
         .get("host")
@@ -371,7 +436,10 @@ async fn exchange(
     ))
 }
 async fn session(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
-    Ok(Json(authenticate(&s, &h, &u, "GET", None)?.metadata()))
+    let mut result = authenticate(&s, &h, &u, "GET", None)?.metadata();
+    result["auth"] = server_auth_descriptor();
+    result["sessionMethod"] = result["method"].clone();
+    Ok(Json(result))
 }
 async fn ticket(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
     let session = authenticate(&s, &h, &u, "POST", None)?;
@@ -390,7 +458,16 @@ async fn pair(
 }
 async fn shell(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
     authenticate(&s, &h, &u, "GET", Some("orchestration:read"))?;
-    Ok(Json(s.store.shell()?))
+    Ok(Json(s.store.compatible_shell()?))
+}
+async fn compatible_thread(
+    State(s): State<Arc<Services>>,
+    h: HeaderMap,
+    u: Uri,
+    Path(id): Path<String>,
+) -> ApiResult {
+    authenticate(&s, &h, &u, "GET", Some("orchestration:read"))?;
+    Ok(Json(s.store.compatible_thread(&id)?))
 }
 async fn thread(
     State(s): State<Arc<Services>>,
@@ -581,7 +658,14 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                     let id=&request["id"];
                     let Some(key)=request_key(id)else{continue};
                     let tag=request["tag"].as_str().unwrap_or_default();let input=&request["payload"];
-                    let streaming=matches!(tag,"orchestration.subscribeShell"|"rust.subscribeThread"|"rust.subscribeEvents");
+                    let streaming=matches!(tag,
+                        "orchestration.subscribeShell"
+                        | "orchestration.subscribeArchivedShell"
+                        | "orchestration.subscribeThread"
+                        | "subscribeServerConfig"
+                        | "rust.subscribeThread"
+                        | "rust.subscribeEvents"
+                    );
                     let response=match rpc(&s,&session,tag,input).await {
                         Ok(value) if streaming=>{
                             let mut input=input.clone();
@@ -600,7 +684,11 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                 let change=match change { Ok(change)=>change, Err(broadcast::error::RecvError::Lagged(_))=>json!({}), Err(_)=>break };
                 if !s.store.session_valid(session.id()).unwrap_or(false){break;}
                 for subscription in subscriptions.values_mut(){
-                    let relevant=matches!(subscription.tag.as_str(),"orchestration.subscribeShell"|"rust.subscribeEvents") || change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"];
+                    let relevant=match subscription.tag.as_str() {
+                        "subscribeServerConfig" => false,
+                        "orchestration.subscribeShell" | "orchestration.subscribeArchivedShell" | "rust.subscribeEvents" => true,
+                        _ => change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"],
+                    };
                     if relevant {
                         subscription.dirty=true;
                         if !flush_subscription(&s,&session,subscription,&mut sender).await{return;}
@@ -614,6 +702,7 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
     let scope = match tag {
         "rust.configureAgent" | "rust.authenticateAgent" => "providers:manage",
         "orchestration.dispatchCommand"
+        | "orchestration.launchThread"
         | "projects.mutate"
         | "rust.cancel"
         | "rust.answerPermission" => "orchestration:operate",
@@ -622,12 +711,44 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
     session.require(scope)?;
     match tag {
         "server.probe" => Ok(s.descriptor.clone()),
+        "server.getConfig" => s.server_config(),
+        "subscribeServerConfig" => {
+            Ok(json!({"version":1,"type":"snapshot","config":s.server_config()?}))
+        }
         "projects.list" => {
             Ok(json!({"projects":s.store.shell()?["projects"],"updatedAt":crate::store::now()}))
         }
         "orchestration.dispatchCommand" | "projects.mutate" => s.dispatch(input.clone()).await,
+        "orchestration.launchThread" => s.launch_thread(input).await,
         "orchestration.subscribeShell" => {
-            Ok(json!({"kind":"snapshot","snapshot":s.store.shell()?}))
+            Ok(json!({"kind":"snapshot","snapshot":s.store.compatible_shell()?}))
+        }
+        "orchestration.getArchivedShellSnapshot" => {
+            let shell = s.store.compatible_shell()?;
+            Ok(json!({
+                "schemaVersion":shell["schemaVersion"],
+                "snapshotSequence":shell["snapshotSequence"],
+                "projects":shell["projects"],
+                "threads":shell["archivedThreads"]
+            }))
+        }
+        "orchestration.subscribeArchivedShell" => {
+            let shell = s.store.compatible_shell()?;
+            Ok(json!({"kind":"snapshot","snapshot":{
+                "schemaVersion":shell["schemaVersion"],
+                "snapshotSequence":shell["snapshotSequence"],
+                "projects":shell["projects"],
+                "threads":shell["archivedThreads"]
+            }}))
+        }
+        "orchestration.getThreadProjection" => {
+            Ok(s.store.compatible_thread(required(input, "threadId")?)?["projection"].clone())
+        }
+        "orchestration.subscribeThread" => {
+            let snapshot = s.store.compatible_thread(required(input, "threadId")?)?;
+            Ok(
+                json!({"kind":"snapshot","snapshotSequence":snapshot["snapshotSequence"],"projection":snapshot["projection"]}),
+            )
         }
         "rust.getThread" | "rust.subscribeThread" => s.store.thread(required(input, "threadId")?),
         "rust.eventsAfter" | "rust.subscribeEvents" => s.store.changes_after(

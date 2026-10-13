@@ -706,7 +706,7 @@ impl Workspace {
             .or_else(|| self.shell["projects"][0]["id"].as_str().map(str::to_owned));
         if let Some(project) = project {
             let id = uuid::Uuid::new_v4().to_string();
-            self.dispatch(json!({"type":"thread.create","threadId":id,"projectId":project,"title":"New thread","modelSelection":{"instanceId":self.provider,"model":"default"},"runtimeMode":"supervised","interactionMode":"default","createdBy":"user","creationSource":"server","branch":null,"worktreePath":null}),Some(id),false,cx);
+            self.dispatch(json!({"type":"thread.create","threadId":id,"projectId":project,"title":"New thread","modelSelection":{"instanceId":self.provider,"model":"default"},"runtimeMode":"full-access","interactionMode":"default","createdBy":"user","creationSource":"server","branch":null,"worktreePath":null}),Some(id),false,cx);
         } else {
             self.page = Page::Project;
             cx.notify();

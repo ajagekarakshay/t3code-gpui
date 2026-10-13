@@ -46,6 +46,16 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         .json()
         .await?;
     let access = token["access_token"].as_str().unwrap();
+    let auth_state: Value = client
+        .get(format!("{base}/api/auth/session"))
+        .bearer_auth(access)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(auth_state["auth"]["policy"], "remote-reachable");
+    assert_eq!(auth_state["sessionMethod"], "bearer-access-token");
     let ticket: Value = client
         .post(format!("{base}/api/auth/websocket-ticket"))
         .bearer_auth(access)
@@ -74,6 +84,73 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         .json()
         .await?;
     assert_eq!(snapshot["projects"][0]["title"], "Transport test");
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":"launch",
+                "tag":"orchestration.launchThread",
+                "payload":{
+                    "commandId":"launch-command",
+                    "creationSource":"web",
+                    "threadId":"thread",
+                    "projectId":"project",
+                    "title":"Compatible thread",
+                    "modelSelection":{"instanceId":"codex","model":"default"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "workspaceStrategy":{"type":"root"}
+                },
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let launch: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(launch["requestId"], "launch");
+    assert_eq!(launch["exit"]["value"]["threadId"], "thread");
+    assert_eq!(launch["exit"]["value"]["resumed"], false);
+    let thread_snapshot: Value = client
+        .get(format!("{base}/api/orchestration/threads/thread"))
+        .bearer_auth(access)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        thread_snapshot["projection"]["thread"]["title"],
+        "Compatible thread"
+    );
+    socket.send(Message::Text(json!([
+        {"_tag":"Request","id":"config","tag":"server.getConfig","payload":{},"headers":[]},
+        {"_tag":"Request","id":"thread-subscription","tag":"orchestration.subscribeThread","payload":{"threadId":"thread"},"headers":[]}
+    ]).to_string().into())).await?;
+    let config: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(config["requestId"], "config");
+    assert_eq!(
+        config["exit"]["value"]["environment"]["orchestrationProtocolVersion"],
+        2
+    );
+    assert_eq!(
+        config["exit"]["value"]["providers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let thread: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(thread["requestId"], "thread-subscription");
+    assert_eq!(thread["values"][0]["kind"], "snapshot");
+    assert_eq!(thread["values"][0]["projection"]["thread"]["id"], "thread");
+    socket
+        .send(Message::Text(
+            json!({"_tag":"Interrupt","requestId":"thread-subscription"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
     socket.send(Message::Text(json!({"_tag":"Request","id":9,"tag":"orchestration.subscribeShell","payload":{},"headers":[]}).to_string().into())).await?;
     let initial: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
     assert_eq!(initial["requestId"], 9);

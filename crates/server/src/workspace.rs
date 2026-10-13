@@ -17,6 +17,12 @@ impl Services {
             command["workspaceRoot"] = json!(root);
         }
         let result = self.store.dispatch(&command)?;
+        if kind == "provider.switch"
+            && let Some(thread_id) = command["threadId"].as_str()
+            && let Some(session) = self.sessions.lock().await.remove(thread_id)
+        {
+            let _ = session.send(SessionCommand::Shutdown).await;
+        }
         let _ = self.changes.send(
             json!({"type":"changed","threadId":command["threadId"],"sequence":result["sequence"]}),
         );
@@ -46,10 +52,93 @@ impl Services {
         Ok(result)
     }
 
+    pub(crate) async fn launch_thread(self: &Arc<Self>, input: &Value) -> Result<Value> {
+        let command_id = required(input, "commandId")?;
+        let thread_id = input["threadId"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let workspace = &input["workspaceStrategy"];
+        let (branch, worktree_path) = match required(workspace, "type")? {
+            "root" => (workspace["branch"].clone(), Value::Null),
+            "existing_worktree" => {
+                let path = tokio::fs::canonicalize(required(workspace, "worktreePath")?)
+                    .await
+                    .context("Existing worktree is unavailable")?;
+                ensure!(path.is_dir(), "Existing worktree is not a directory");
+                (workspace["branch"].clone(), json!(path))
+            }
+            "worktree" => anyhow::bail!("Creating Git worktrees is not ported yet"),
+            _ => anyhow::bail!("Unsupported workspace strategy"),
+        };
+        if let Some(message) = input.get("initialMessage") {
+            required(message, "text")?;
+            ensure!(
+                message["attachments"].as_array().is_none_or(Vec::is_empty),
+                "Attachments are not ported yet"
+            );
+        }
+        let reuse = input["reuseExistingThread"] == true;
+        if reuse {
+            self.store.thread(&thread_id)?;
+        } else {
+            self.dispatch(json!({
+                "type":"thread.create",
+                "commandId":format!("{command_id}:thread"),
+                "createdBy":"user",
+                "creationSource":input.get("creationSource").cloned().unwrap_or(json!("web")),
+                "threadId":thread_id,
+                "projectId":input["projectId"],
+                "title":input["title"],
+                "modelSelection":input["modelSelection"],
+                "runtimeMode":input["runtimeMode"],
+                "interactionMode":input["interactionMode"],
+                "branch":branch,
+                "worktreePath":worktree_path
+            }))
+            .await?;
+        }
+        if let Some(message) = input.get("initialMessage")
+            && let Err(error) = self
+                .dispatch(json!({
+                    "type":"message.dispatch",
+                    "commandId":command_id,
+                    "createdBy":"user",
+                    "creationSource":input.get("creationSource").cloned().unwrap_or(json!("web")),
+                    "threadId":thread_id,
+                    "messageId":message.get("messageId").cloned().unwrap_or(json!(uuid::Uuid::new_v4().to_string())),
+                    "text":message["text"],
+                    "attachments":message["attachments"],
+                    "dispatchMode":{"type":"start_immediately"}
+                }))
+                .await
+        {
+            if !reuse {
+                let _ = self
+                    .dispatch(json!({"type":"thread.delete","commandId":format!("{command_id}:rollback"),"threadId":thread_id}))
+                    .await;
+            }
+            return Err(error);
+        }
+        Ok(json!({
+            "threadId":thread_id,
+            "projection":self.store.compatible_thread(&thread_id)?["projection"],
+            "resumed":reuse
+        }))
+    }
+
     async fn execute_pending(self: &Arc<Self>) -> Result<()> {
         let _serialized = self.effects.lock().await;
         while let Some((id, thread_id, command)) = self.store.claim_effect()? {
-            if let Err(error) = self.deliver_prompt(&thread_id, &command).await {
+            let effect = match command["type"].as_str() {
+                Some("message.dispatch") => self.deliver_prompt(&thread_id, &command).await,
+                Some("runtime-request.respond") => {
+                    self.deliver_permission_response(&thread_id, &command).await
+                }
+                Some("run.interrupt") => self.cancel(&thread_id).await,
+                _ => anyhow::bail!("Unsupported durable effect"),
+            };
+            if let Err(error) = effect {
                 let change = self.store.agent_event(
                     &thread_id,
                     &json!({"type":"acp.failure","message":error.to_string()}),
@@ -63,6 +152,43 @@ impl Services {
             }
             self.store.complete_effect(id)?;
         }
+        Ok(())
+    }
+
+    async fn deliver_permission_response(
+        self: &Arc<Self>,
+        thread_id: &str,
+        command: &Value,
+    ) -> Result<()> {
+        let request_id = required(command, "requestId")?;
+        let snapshot = self.store.thread(thread_id)?;
+        let permission = &snapshot["thread"]["pendingAcpPermission"];
+        ensure!(
+            permission["id"] == request_id,
+            "Permission request is no longer pending"
+        );
+        let desired_kind = match command["decision"].as_str() {
+            Some("accept") => Some("allow_once"),
+            Some("acceptForSession" | "acceptAlways") => Some("allow_always"),
+            Some("decline") => Some("reject_once"),
+            Some("cancel") => None,
+            _ => anyhow::bail!("Unsupported approval decision"),
+        };
+        let option = desired_kind
+            .and_then(|kind| {
+                permission["request"]["options"]
+                    .as_array()?
+                    .iter()
+                    .find(|option| option["kind"] == kind)
+            })
+            .and_then(|option| option["optionId"].as_str())
+            .map(str::to_owned);
+        ensure!(
+            desired_kind.is_none() || option.is_some(),
+            "The provider did not offer that approval choice"
+        );
+        self.answer_permission(thread_id, request_id, option)
+            .await?;
         Ok(())
     }
 
@@ -251,7 +377,7 @@ impl Services {
         thread_id: &str,
         id: &str,
         option: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<Value> {
         let session = self
             .sessions
             .lock()
@@ -267,8 +393,9 @@ impl Services {
             false,
             None,
         )?;
+        let sequence = change["sequence"].clone();
         let _ = self.changes.send(change);
         self.queue_activity(thread_id, ActivityKind::Normal).await;
-        Ok(())
+        Ok(json!({"sequence":sequence}))
     }
 }
