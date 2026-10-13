@@ -3,6 +3,7 @@
 mod activity;
 mod attachments;
 mod auth;
+mod checkpoints;
 mod cloud;
 mod filesystem;
 mod home;
