@@ -56,6 +56,15 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         .await?;
     assert_eq!(auth_state["auth"]["policy"], "remote-reachable");
     assert_eq!(auth_state["sessionMethod"], "bearer-access-token");
+    let missing = client
+        .get(format!("{base}/api/orchestration/threads/missing/bounded"))
+        .bearer_auth(access)
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing: Value = missing.json().await?;
+    assert_eq!(missing["_tag"], "EnvironmentResourceNotFoundError");
+    assert_eq!(missing["reason"], "thread_not_found");
     let ticket: Value = client
         .post(format!("{base}/api/auth/websocket-ticket"))
         .bearer_auth(access)

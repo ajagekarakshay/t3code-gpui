@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::{
@@ -166,6 +167,10 @@ impl Store {
 
     pub(crate) fn compatible_thread(&self, id: &str) -> Result<Value> {
         let snapshot = self.thread(id)?;
+        ensure!(
+            snapshot["thread"]["deletedAt"].is_null(),
+            "Thread was deleted"
+        );
         let mut thread = snapshot["thread"].clone();
         normalize_thread_status(&mut thread);
         let messages = snapshot["messages"]
@@ -357,6 +362,153 @@ impl Store {
         Ok(json!({"snapshotSequence":snapshot["snapshotSequence"],"projection":projection}))
     }
 
+    pub(crate) fn compatible_thread_bounded(&self, id: &str, compact: bool) -> Result<Value> {
+        let mut snapshot = self.compatible_thread(id)?;
+        let sequence = snapshot["snapshotSequence"]
+            .as_u64()
+            .context("Invalid snapshot sequence")?;
+        let projection = &mut snapshot["projection"];
+        let visible = projection["visibleTurnItems"]
+            .as_array()
+            .context("Missing visible turn items")?;
+        let latest_local = projection["turnItems"].as_array().and_then(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["ordinal"].as_u64())
+                .max()
+        });
+        let start = recent_history_start(visible, 10, 75);
+        let selected = visible[start..]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(position, mut row)| {
+                row["position"] = json!(position);
+                row
+            })
+            .collect::<Vec<_>>();
+        let selected_ids = selected
+            .iter()
+            .filter_map(|row| row["sourceItemId"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let selected_message_ids = selected
+            .iter()
+            .filter_map(|row| row["item"]["messageId"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let turn_items = projection["turnItems"]
+            .as_array()
+            .context("Missing turn items")?
+            .iter()
+            .filter(|item| {
+                item["id"]
+                    .as_str()
+                    .is_some_and(|item_id| selected_ids.contains(item_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let messages = projection["messages"]
+            .as_array()
+            .context("Missing messages")?
+            .iter()
+            .filter(|message| {
+                message["id"]
+                    .as_str()
+                    .is_some_and(|message_id| selected_message_ids.contains(message_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let cursor = (start > 0)
+            .then(|| encode_history_cursor(sequence, &visible[start]))
+            .transpose()?;
+        projection["visibleTurnItems"] = json!(selected);
+        projection["messages"] = json!(messages);
+        let compacted = compact && !turn_items.is_empty();
+        projection["turnItems"] = if compacted {
+            json!([])
+        } else {
+            json!(turn_items)
+        };
+        let payload_budget_exceeded = serde_json::to_vec(projection)?.len() > 1_048_576;
+        let mut bounded = json!({
+            "snapshotSequence":sequence,
+            "projection":projection,
+            "historyCursor":cursor,
+            "hasMoreHistory":start > 0,
+            "latestLocalTurnOrdinal":latest_local,
+            "payloadBudgetExceeded":payload_budget_exceeded
+        });
+        if compacted {
+            bounded["turnItemsOmitLocalVisible"] = json!(true);
+        }
+        Ok(bounded)
+    }
+
+    pub(crate) fn compatible_thread_history(
+        &self,
+        id: &str,
+        cursor: &str,
+        through_entry_id: Option<&str>,
+        conversation_only: bool,
+    ) -> Result<Value> {
+        let snapshot = self.compatible_thread(id)?;
+        let sequence = snapshot["snapshotSequence"]
+            .as_u64()
+            .context("Invalid snapshot sequence")?;
+        let visible = snapshot["projection"]["visibleTurnItems"]
+            .as_array()
+            .context("Missing visible turn items")?;
+        let decoded = decode_history_cursor(cursor)?;
+        let anchor = visible
+            .iter()
+            .position(|row| {
+                row["sourceThreadId"] == decoded["st"] && row["sourceItemId"] == decoded["si"]
+            })
+            .unwrap_or_else(|| {
+                decoded["p"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .min(visible.len() as u64) as usize
+            });
+        let mut start = recent_history_start(&visible[..anchor], 20, 75);
+        if let Some(entry_id) = through_entry_id
+            && let Some(target) = visible[..anchor].iter().position(|row| {
+                row["item"]["messageId"] == entry_id || row["item"]["id"] == entry_id
+            })
+        {
+            start = start.min(target).max(anchor.saturating_sub(150));
+        }
+        let has_more = start > 0;
+        let next_cursor = has_more
+            .then(|| encode_history_cursor(sequence, &visible[start]))
+            .transpose()?;
+        let has_user_turns = visible[..anchor]
+            .iter()
+            .any(|row| is_user_turn(&row["item"]));
+        let items = visible[start..anchor]
+            .iter()
+            .filter(|row| {
+                !conversation_only
+                    || !has_user_turns
+                    || !matches!(
+                        row["item"]["type"].as_str(),
+                        Some("command_execution" | "reasoning" | "file_change" | "dynamic_tool")
+                    )
+            })
+            .cloned()
+            .enumerate()
+            .map(|(position, mut row)| {
+                row["position"] = json!(position);
+                row
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "snapshotSequence":sequence,
+            "items":items,
+            "nextCursor":next_cursor,
+            "hasMoreHistory":has_more
+        }))
+    }
+
     pub(crate) fn thread(&self, id: &str) -> Result<Value> {
         let connection = self.lock()?;
         let thread = read_record(&connection, "threads", id)?;
@@ -374,6 +526,14 @@ impl Store {
                 row.get(0)
             })?;
         Ok(json!({"snapshotSequence":sequence,"thread":thread,"messages":messages}))
+    }
+
+    pub(crate) fn thread_available(&self, id: &str) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM threads WHERE id=? AND json_extract(value,'$.deletedAt') IS NULL)",
+            [id],
+            |row| row.get(0),
+        )?)
     }
 
     /// Replay committed changes in bounded pages; the cursor advances only after delivery.
@@ -894,6 +1054,67 @@ fn permission_request_kind(request: &Value) -> &'static str {
     }
 }
 
+fn is_user_turn(item: &Value) -> bool {
+    item["type"] == "user_message" && item["createdBy"] == "user"
+}
+
+fn recent_history_start(items: &[Value], max_user_turns: usize, max_items: usize) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    let has_user_turns = items.iter().any(|row| is_user_turn(&row["item"]));
+    if !has_user_turns {
+        return items.len().saturating_sub(max_items);
+    }
+    let mut turns = 0;
+    for index in (0..items.len()).rev() {
+        if turns == max_user_turns {
+            return index + 1;
+        }
+        if is_user_turn(&items[index]["item"]) {
+            turns += 1;
+        }
+    }
+    0
+}
+
+fn encode_history_cursor(sequence: u64, row: &Value) -> Result<String> {
+    let payload = json!({
+        "v":1,
+        "seq":sequence,
+        "st":required(row,"sourceThreadId")?,
+        "si":required(row,"sourceItemId")?,
+        "p":row["position"].as_u64().context("Invalid history position")?
+    });
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?))
+}
+
+fn decode_history_cursor(cursor: &str) -> Result<Value> {
+    ensure!(
+        !cursor.is_empty() && cursor.len() <= 4_096,
+        "Invalid history cursor"
+    );
+    let payload: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(cursor)
+            .context("Invalid history cursor")?,
+    )
+    .context("Invalid history cursor")?;
+    ensure!(
+        payload["v"] == 1
+            && payload["seq"].as_u64().is_some()
+            && payload["st"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && payload["si"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && payload["p"].as_u64().is_some(),
+        "Invalid history cursor"
+    );
+    Ok(payload)
+}
+
 fn exists(connection: &Connection, table: &str, id: &str) -> Result<bool> {
     Ok(connection.query_row(
         &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?)"),
@@ -1039,6 +1260,62 @@ mod tests {
         assert_eq!(thread["providerInstanceId"], "claude-code");
         Ok(())
     }
+
+    #[test]
+    fn bounded_snapshots_page_complete_older_turns_and_support_compaction() -> Result<()> {
+        let (_directory, store) = setup()?;
+        for turn in 0..12 {
+            store.dispatch(&json!({
+                "type":"message.dispatch",
+                "commandId":format!("send-{turn}"),
+                "threadId":"thread",
+                "messageId":format!("message-{turn}"),
+                "text":format!("prompt {turn}"),
+                "attachments":[]
+            }))?;
+            store.agent_event(
+                "thread",
+                &json!({"type":"acp.turn.finished","data":{"stopReason":"end_turn"}}),
+                Some(&format!("reply {turn}")),
+                true,
+                None,
+            )?;
+        }
+        let bounded = store.compatible_thread_bounded("thread", false)?;
+        assert_eq!(bounded["hasMoreHistory"], true);
+        assert_eq!(
+            bounded["projection"]["visibleTurnItems"]
+                .as_array()
+                .unwrap()
+                .len(),
+            20
+        );
+        assert_eq!(bounded["latestLocalTurnOrdinal"], 23);
+        let cursor = bounded["historyCursor"]
+            .as_str()
+            .context("History cursor")?;
+        let page = store.compatible_thread_history("thread", cursor, None, false)?;
+        assert_eq!(page["hasMoreHistory"], false);
+        assert_eq!(page["items"].as_array().unwrap().len(), 4);
+        assert_eq!(page["items"][0]["item"]["text"], "prompt 0");
+        assert_eq!(page["items"][3]["item"]["text"], "reply 1");
+
+        let compact = store.compatible_thread_bounded("thread", true)?;
+        assert_eq!(compact["turnItemsOmitLocalVisible"], true);
+        assert!(
+            compact["projection"]["turnItems"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .compatible_thread_history("thread", "not-a-cursor", None, false)
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn native_tool_updates_and_pending_permissions_survive_snapshot_reads() -> Result<()> {
         let (_directory, store) = setup()?;

@@ -127,6 +127,14 @@ impl Server {
             .route("/api/auth/pairing-token", post(pair))
             .route("/api/orchestration/shell", get(shell))
             .route("/api/orchestration/threads/{id}", get(compatible_thread))
+            .route(
+                "/api/orchestration/threads/{id}/bounded",
+                get(compatible_thread_bounded),
+            )
+            .route(
+                "/api/orchestration/threads/{id}/history",
+                get(compatible_thread_history),
+            )
             .route("/api/rust/threads/{id}", get(thread))
             .route("/api/projects", get(projects))
             .route("/api/projects/mutate", post(dispatch))
@@ -316,6 +324,22 @@ impl IntoResponse for ApiError {
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
+fn require_thread(s: &Services, id: &str) -> Result<(), ApiError> {
+    if s.store.thread_available(id)? {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::NOT_FOUND,
+            json!({
+                "_tag":"EnvironmentResourceNotFoundError",
+                "code":"not_found",
+                "reason":"thread_not_found",
+                "traceId":uuid::Uuid::new_v4().to_string()
+            }),
+        ))
+    }
+}
+
 fn server_auth_descriptor() -> Value {
     json!({
         "policy":"remote-reachable",
@@ -467,7 +491,50 @@ async fn compatible_thread(
     Path(id): Path<String>,
 ) -> ApiResult {
     authenticate(&s, &h, &u, "GET", Some("orchestration:read"))?;
+    require_thread(&s, &id)?;
     Ok(Json(s.store.compatible_thread(&id)?))
+}
+async fn compatible_thread_bounded(
+    State(s): State<Arc<Services>>,
+    h: HeaderMap,
+    u: Uri,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    authenticate(&s, &h, &u, "GET", Some("orchestration:read"))?;
+    require_thread(&s, &id)?;
+    Ok(Json(
+        s.store.compatible_thread_bounded(
+            &id,
+            query
+                .get("compactTurnItems")
+                .is_some_and(|value| value == "1"),
+        )?,
+    ))
+}
+async fn compatible_thread_history(
+    State(s): State<Arc<Services>>,
+    h: HeaderMap,
+    u: Uri,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    authenticate(&s, &h, &u, "GET", Some("orchestration:read"))?;
+    require_thread(&s, &id)?;
+    let cursor = query.get("cursor").context("Missing history cursor")?;
+    let view = query.get("view").map(String::as_str);
+    if !view.is_none_or(|view| matches!(view, "conversation" | "activity")) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid history view",
+        ));
+    }
+    Ok(Json(s.store.compatible_thread_history(
+        &id,
+        cursor,
+        query.get("throughEntryId").map(String::as_str),
+        view == Some("conversation"),
+    )?))
 }
 async fn thread(
     State(s): State<Arc<Services>>,
@@ -745,10 +812,22 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
             Ok(s.store.compatible_thread(required(input, "threadId")?)?["projection"].clone())
         }
         "orchestration.subscribeThread" => {
-            let snapshot = s.store.compatible_thread(required(input, "threadId")?)?;
-            Ok(
-                json!({"kind":"snapshot","snapshotSequence":snapshot["snapshotSequence"],"projection":snapshot["projection"]}),
-            )
+            if input["acceptBoundedSnapshot"] == true {
+                let snapshot = s.store.compatible_thread_bounded(
+                    required(input, "threadId")?,
+                    input["acceptCompactTurnItems"] == true,
+                )?;
+                let mut response = json!({"kind":"snapshot","snapshotSequence":snapshot["snapshotSequence"],"projection":snapshot["projection"],"historyCursor":snapshot["historyCursor"],"hasMoreHistory":snapshot["hasMoreHistory"],"latestLocalTurnOrdinal":snapshot["latestLocalTurnOrdinal"],"payloadBudgetExceeded":snapshot["payloadBudgetExceeded"]});
+                if snapshot["turnItemsOmitLocalVisible"] == true {
+                    response["turnItemsOmitLocalVisible"] = json!(true);
+                }
+                Ok(response)
+            } else {
+                let snapshot = s.store.compatible_thread(required(input, "threadId")?)?;
+                Ok(
+                    json!({"kind":"snapshot","snapshotSequence":snapshot["snapshotSequence"],"projection":snapshot["projection"]}),
+                )
+            }
         }
         "rust.getThread" | "rust.subscribeThread" => s.store.thread(required(input, "threadId")?),
         "rust.eventsAfter" | "rust.subscribeEvents" => s.store.changes_after(
