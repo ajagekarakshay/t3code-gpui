@@ -212,7 +212,7 @@ export interface Dependencies extends FileRevisionsDependencies {
 }
 
 // A plain factory rather than a `Context.Service` (against the preference in
-// `.repos/effect-smol/LLMS.md`): the held revisions, refresh set, and write gates are only correct
+// `backup/references/effect-smol/LLMS.md`): the held revisions, refresh set, and write gates are only correct
 // at one instance per service, and a layer provided at two points would give two of each behind
 // one epoch counter.
 export const make = (dependencies: Dependencies) => {

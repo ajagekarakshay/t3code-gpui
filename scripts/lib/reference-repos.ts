@@ -11,7 +11,7 @@ export interface ReferenceRepo {
 export const referenceRepos: ReadonlyArray<ReferenceRepo> = [
   {
     id: "effect-smol",
-    prefix: ".repos/effect-smol",
+    prefix: "backup/references/effect-smol",
     repository: "https://github.com/Effect-TS/effect.git",
     latestRef: "main",
     versionSourcePath: "pnpm-workspace.yaml",
@@ -20,7 +20,7 @@ export const referenceRepos: ReadonlyArray<ReferenceRepo> = [
   },
   {
     id: "alchemy-effect",
-    prefix: ".repos/alchemy-effect",
+    prefix: "backup/references/alchemy-effect",
     repository: "https://github.com/alchemy-run/alchemy-effect.git",
     latestRef: "main",
     versionSourcePath: "infra/relay/package.json",

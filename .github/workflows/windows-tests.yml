@@ -34,7 +34,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       # setup-vp's own cache restores a Linux-shaped store on Windows, which is

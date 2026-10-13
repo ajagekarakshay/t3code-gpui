@@ -319,7 +319,7 @@ export const syncReferenceReposCommand = Command.make(
       latest,
       dryRun,
     }),
-).pipe(Command.withDescription("Sync vendored reference repositories under .repos/."));
+).pipe(Command.withDescription("Sync vendored reference repositories under backup/references/."));
 
 if (import.meta.main) {
   Command.run(syncReferenceReposCommand, { version: "0.0.0" }).pipe(

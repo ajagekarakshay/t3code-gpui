@@ -27,7 +27,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Reject repository-owned PR assets
@@ -65,7 +65,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -91,7 +91,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/setup-apt-mirrors
@@ -145,7 +145,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       # Blacksmith boots GitHub's Ubuntu runner image (gcc is usually present),
@@ -209,7 +209,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -242,7 +242,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -323,7 +323,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Rust
@@ -435,7 +435,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -463,7 +463,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+

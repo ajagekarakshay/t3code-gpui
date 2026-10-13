@@ -195,7 +195,7 @@ it.layer(NodeServices.layer)("sync-reference-repos", (it) => {
       assert.deepStrictEqual(addPlan.args, [
         "subtree",
         "add",
-        "--prefix=.repos/effect-smol",
+        "--prefix=backup/references/effect-smol",
         "https://github.com/Effect-TS/effect.git",
         "effect@4.0.0-beta.73",
         "--squash",
@@ -230,7 +230,7 @@ it.layer(NodeServices.layer)("sync-reference-repos", (it) => {
           args: [
             "subtree",
             "add",
-            "--prefix=.repos/effect-smol",
+            "--prefix=backup/references/effect-smol",
             "https://github.com/Effect-TS/effect.git",
             "effect@4.0.0-beta.73",
             "--squash",

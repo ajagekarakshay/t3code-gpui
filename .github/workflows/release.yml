@@ -125,7 +125,7 @@ jobs:
           fetch-depth: 0
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -243,7 +243,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -277,7 +277,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -317,7 +317,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -368,7 +368,7 @@ jobs:
           ref: ${{ needs.resolve_commit.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -470,7 +470,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -720,7 +720,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -781,7 +781,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -982,7 +982,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -1078,7 +1078,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -1150,7 +1150,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -1213,7 +1213,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -1263,7 +1263,7 @@ jobs:
           persist-credentials: true
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - id: app_bot
@@ -1338,7 +1338,7 @@ jobs:
           ref: ${{ needs.preflight.outputs.ref }}
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+

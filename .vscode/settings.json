@@ -6,12 +6,12 @@
   },
   "oxc.unusedDisableDirectives": "warn",
   "js/ts.tsdk.path": "node_modules/typescript/lib",
-  "typescript.preferences.autoImportFileExcludePatterns": [".repos/**"],
-  "javascript.preferences.autoImportFileExcludePatterns": [".repos/**"],
+  "typescript.preferences.autoImportFileExcludePatterns": ["backup/references/**"],
+  "javascript.preferences.autoImportFileExcludePatterns": ["backup/references/**"],
   "files.watcherExclude": {
-    ".repos/**": true
+    "backup/references/**": true
   },
   "search.exclude": {
-    ".repos/**": true
+    "backup/references/**": true
   }
 }

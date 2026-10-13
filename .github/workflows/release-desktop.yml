@@ -126,7 +126,7 @@ jobs:
           git init .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
-          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git sparse-checkout set --no-cone '/*' '!/backup/references/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
 
       # The runner's PowerShell 7.6/.NET 10 intermittently crashes during signing:

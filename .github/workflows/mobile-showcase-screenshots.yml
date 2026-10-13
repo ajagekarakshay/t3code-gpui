@@ -55,7 +55,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -117,7 +117,7 @@ jobs:
         with:
           sparse-checkout: |
             /*
-            !/.repos/
+            !/backup/references/
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+

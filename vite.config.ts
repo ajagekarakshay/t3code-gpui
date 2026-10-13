@@ -62,7 +62,7 @@ export default defineConfig({
   test: {
     environment: "node",
     exclude: [
-      "**/.repos/**",
+      "**/backup/references/**",
       "**/.t3/**",
       "**/node_modules/**",
       "**/dist/**",
@@ -83,7 +83,7 @@ export default defineConfig({
   },
   fmt: {
     ignorePatterns: [
-      ".repos/**",
+      "backup/references/**",
       // Macroscope's glob-per-line ignore grammar, not Markdown: formatting
       // it rewrites `*` as `_` and joins lines.
       ".macroscope/ignore.md",
@@ -111,8 +111,8 @@ export default defineConfig({
   },
   lint: {
     ignorePatterns: [
-      ".repos",
-      ".repos/**",
+      "backup/references",
+      "backup/references/**",
       "dist",
       "dist-electron",
       "node_modules",
