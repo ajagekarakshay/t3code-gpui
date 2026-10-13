@@ -862,6 +862,7 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                         | "subscribeServerConfig"
                         | "subscribeServerLifecycle"
                         | "subscribeAuthAccess"
+                        | "subscribeVcsStatus"
                         | "provider.auth.subscribe"
                         | "rust.subscribeThread"
                         | "rust.subscribeEvents"
@@ -887,6 +888,7 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                     let relevant=match subscription.tag.as_str() {
                         "subscribeAuthAccess" => change["authAccess"] == true,
                         "subscribeServerConfig" | "subscribeServerLifecycle" | "provider.auth.subscribe" => false,
+                        "subscribeVcsStatus" => change["vcsCwd"] == subscription.input["cwd"],
                         "orchestration.subscribeShell" | "orchestration.subscribeArchivedShell" | "rust.subscribeEvents" => true,
                         "orchestration.searchThreadStream" => change["threadId"]==subscription.input["threadId"],
                         _ => change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"],
@@ -900,6 +902,11 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
         }
     }
 }
+
+fn notify_vcs(services: &Services, input: &Value) {
+    let _ = services.changes.send(json!({"vcsCwd":input["cwd"]}));
+}
+
 async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> Result<Value> {
     let scope = match tag {
         "subscribeAuthAccess" => "access:read",
@@ -912,6 +919,8 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         | "rust.authenticateAgent"
         | "provider.auth.subscribe"
         | "server.refreshProviders" => "providers:manage",
+        "vcs.pull" | "vcs.createWorktree" | "vcs.removeWorktree" | "vcs.createRef"
+        | "vcs.switchRef" | "vcs.init" => "source-control:write",
         "orchestration.dispatchCommand"
         | "orchestration.launchThread"
         | "projects.mutate"
@@ -992,6 +1001,41 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         }
         "projects.writeFile" => {
             crate::filesystem::write_file(s.filesystem.clone(), input.clone()).await
+        }
+        "subscribeVcsStatus" => Ok(crate::vcs::status_stream_snapshot(
+            crate::vcs::status(input).await?,
+        )),
+        "vcs.refreshStatus" => crate::vcs::status(input).await,
+        "vcs.listRefs" => crate::vcs::list_refs(input).await,
+        "vcs.createWorktree" => {
+            let result = crate::vcs::create_worktree(&s.home, input).await?;
+            notify_vcs(s, input);
+            Ok(result)
+        }
+        "vcs.removeWorktree" => {
+            let result = crate::vcs::remove_worktree(input).await?;
+            notify_vcs(s, input);
+            Ok(result)
+        }
+        "vcs.createRef" => {
+            let result = crate::vcs::create_ref(input).await?;
+            notify_vcs(s, input);
+            Ok(result)
+        }
+        "vcs.switchRef" => {
+            let result = crate::vcs::switch_ref(input).await?;
+            notify_vcs(s, input);
+            Ok(result)
+        }
+        "vcs.init" => {
+            let result = crate::vcs::init(input).await?;
+            notify_vcs(s, input);
+            Ok(result)
+        }
+        "vcs.pull" => {
+            let result = crate::vcs::pull(input).await?;
+            notify_vcs(s, input);
+            Ok(result)
         }
         "orchestration.dispatchCommand" | "projects.mutate" => s.dispatch(input.clone()).await,
         "orchestration.launchThread" => s.launch_thread(input).await,

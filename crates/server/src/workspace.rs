@@ -48,18 +48,64 @@ impl Services {
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let reuse = input["reuseExistingThread"] == true;
         let workspace = &input["workspaceStrategy"];
-        let (branch, worktree_path) = match required(workspace, "type")? {
-            "root" => (workspace["branch"].clone(), Value::Null),
-            "existing_worktree" => {
-                let path = tokio::fs::canonicalize(required(workspace, "worktreePath")?)
-                    .await
-                    .context("Existing worktree is unavailable")?;
-                ensure!(path.is_dir(), "Existing worktree is not a directory");
-                (workspace["branch"].clone(), json!(path))
+        let mut created_worktree = None::<(String, String)>;
+        let (branch, worktree_path) = if reuse {
+            let existing = self.store.thread(&thread_id)?;
+            (
+                existing["thread"]["branch"].clone(),
+                existing["thread"]["worktreePath"].clone(),
+            )
+        } else {
+            match required(workspace, "type")? {
+                "root" => (workspace["branch"].clone(), Value::Null),
+                "existing_worktree" => {
+                    let path = tokio::fs::canonicalize(required(workspace, "worktreePath")?)
+                        .await
+                        .context("Existing worktree is unavailable")?;
+                    ensure!(path.is_dir(), "Existing worktree is not a directory");
+                    (workspace["branch"].clone(), json!(path))
+                }
+                "worktree" => {
+                    let shell = self.store.shell()?;
+                    let project_id = required(input, "projectId")?;
+                    let project = shell["projects"]
+                        .as_array()
+                        .context("Missing projects")?
+                        .iter()
+                        .find(|project| project["id"] == project_id)
+                        .context("Project unavailable")?;
+                    let root = required(project, "workspaceRoot")?;
+                    let base = required(workspace, "baseRef")?;
+                    let base = if workspace["startFromOrigin"] == true {
+                        crate::vcs::fetch_ref(root, "origin", base).await?;
+                        format!("origin/{base}")
+                    } else {
+                        base.to_owned()
+                    };
+                    let short_id = thread_id.chars().take(8).collect::<String>();
+                    let branch = workspace["branch"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("t3code/{short_id}"));
+                    let created = crate::vcs::create_worktree(
+                        &self.home,
+                        &json!({
+                            "cwd":root,
+                            "refName":base,
+                            "newRefName":branch,
+                            "baseRefName":base,
+                            "path":null
+                        }),
+                    )
+                    .await?;
+                    let path = created["worktree"]["path"].clone();
+                    created_worktree = path.as_str().map(|path| (root.to_owned(), path.to_owned()));
+                    (created["worktree"]["refName"].clone(), path)
+                }
+                _ => anyhow::bail!("Unsupported workspace strategy"),
             }
-            "worktree" => anyhow::bail!("Creating Git worktrees is not ported yet"),
-            _ => anyhow::bail!("Unsupported workspace strategy"),
         };
         if let Some(message) = input.get("initialMessage") {
             required(message, "text")?;
@@ -68,25 +114,33 @@ impl Services {
                 "Attachments are not ported yet"
             );
         }
-        let reuse = input["reuseExistingThread"] == true;
         if reuse {
-            self.store.thread(&thread_id)?;
+            // The lookup above also preserves the existing workspace binding.
         } else {
-            self.dispatch(json!({
-                "type":"thread.create",
-                "commandId":format!("{command_id}:thread"),
-                "createdBy":"user",
-                "creationSource":input.get("creationSource").cloned().unwrap_or(json!("web")),
-                "threadId":thread_id,
-                "projectId":input["projectId"],
-                "title":input["title"],
-                "modelSelection":input["modelSelection"],
-                "runtimeMode":input["runtimeMode"],
-                "interactionMode":input["interactionMode"],
-                "branch":branch,
-                "worktreePath":worktree_path
-            }))
-            .await?;
+            if let Err(error) = self
+                .dispatch(json!({
+                    "type":"thread.create",
+                    "commandId":format!("{command_id}:thread"),
+                    "createdBy":"user",
+                    "creationSource":input.get("creationSource").cloned().unwrap_or(json!("web")),
+                    "threadId":thread_id,
+                    "projectId":input["projectId"],
+                    "title":input["title"],
+                    "modelSelection":input["modelSelection"],
+                    "runtimeMode":input["runtimeMode"],
+                    "interactionMode":input["interactionMode"],
+                    "branch":branch,
+                    "worktreePath":worktree_path
+                }))
+                .await
+            {
+                if let Some((root, path)) = created_worktree.take() {
+                    let _ =
+                        crate::vcs::remove_worktree(&json!({"cwd":root,"path":path,"force":true}))
+                            .await;
+                }
+                return Err(error);
+            }
         }
         if let Some(message) = input.get("initialMessage")
             && let Err(error) = self
@@ -107,6 +161,12 @@ impl Services {
                 let _ = self
                     .dispatch(json!({"type":"thread.delete","commandId":format!("{command_id}:rollback"),"threadId":thread_id}))
                     .await;
+                if let Some((root, path)) = created_worktree {
+                    let _ = crate::vcs::remove_worktree(
+                        &json!({"cwd":root,"path":path,"force":true}),
+                    )
+                    .await;
+                }
             }
             return Err(error);
         }
@@ -410,5 +470,76 @@ impl Services {
         let _ = self.changes.send(change);
         self.queue_activity(thread_id, ActivityKind::Normal).await;
         Ok(json!({"sequence":sequence}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Server, ServerOptions};
+    use tokio::process::Command;
+
+    async fn git(directory: &std::path::Path, args: &[&str]) -> Result<()> {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .status()
+            .await?;
+        ensure!(status.success(), "Test Git command failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn launches_threads_in_new_git_worktrees() -> Result<()> {
+        let repository = tempfile::tempdir()?;
+        git(repository.path(), &["init", "-b", "main"]).await?;
+        tokio::fs::write(repository.path().join("README.md"), "hello\n").await?;
+        git(repository.path(), &["add", "."]).await?;
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=T3 Test",
+                "-c",
+                "user.email=test@t3.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .await?;
+
+        let home = tempfile::tempdir()?;
+        let server = Server::open(ServerOptions::new(home.path()))?;
+        server
+            .dispatch(json!({
+                "type":"project.create",
+                "commandId":"project-command",
+                "projectId":"project",
+                "title":"Repository",
+                "workspaceRoot":repository.path(),
+                "defaultModelSelection":{"instanceId":"codex","model":"default"}
+            }))
+            .await?;
+        let launched = server
+            .services
+            .launch_thread(&json!({
+                "commandId":"launch-command",
+                "threadId":"thread",
+                "projectId":"project",
+                "title":"Worktree thread",
+                "modelSelection":{"instanceId":"codex","model":"default"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "workspaceStrategy":{"type":"worktree","baseRef":"main","branch":"feature/native"}
+            }))
+            .await?;
+        let path = launched["projection"]["thread"]["worktreePath"]
+            .as_str()
+            .context("Missing worktree path")?;
+        assert!(std::path::Path::new(path).is_dir());
+        assert_eq!(launched["projection"]["thread"]["branch"], "feature/native");
+        server.shutdown().await;
+        Ok(())
     }
 }

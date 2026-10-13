@@ -8,6 +8,7 @@ mod home;
 mod http;
 mod relay_client;
 mod store;
+mod vcs;
 mod workspace;
 
 pub use http::{Server, ServerOptions};
