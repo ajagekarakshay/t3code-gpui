@@ -45,7 +45,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, command TEXT NOT NULL, result TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL, value TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
             CREATE TABLE IF NOT EXISTS grants (hash TEXT PRIMARY KEY, scopes TEXT NOT NULL, proof_key TEXT, expires INTEGER NOT NULL, reusable INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS grant_details (hash TEXT PRIMARY KEY REFERENCES grants(hash) ON DELETE CASCADE, id TEXT NOT NULL UNIQUE, subject TEXT NOT NULL, label TEXT, created INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, hash TEXT UNIQUE NOT NULL, scopes TEXT NOT NULL, proof_key TEXT, expires INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_details (session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE, subject TEXT NOT NULL, client TEXT NOT NULL, issued INTEGER NOT NULL, last_connected INTEGER);
             CREATE TABLE IF NOT EXISTS tickets (hash TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, expires INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS replay_guards (key TEXT PRIMARY KEY, expires INTEGER NOT NULL);")?;
         // A lost process cannot replay an accepted prompt safely. Retire it and expose failure.

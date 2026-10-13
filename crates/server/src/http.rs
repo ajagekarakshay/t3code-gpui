@@ -54,6 +54,7 @@ pub(crate) struct Services {
     pub(crate) store: Store,
     pub(crate) agents: BTreeMap<String, AgentCommand>,
     pub(crate) sessions: Mutex<HashMap<String, AgentSession>>,
+    auth_connections: std::sync::Mutex<HashMap<String, usize>>,
     pub(crate) changes: broadcast::Sender<Value>,
     pub(crate) effects: Mutex<()>,
     pub(crate) filesystem: crate::filesystem::WorkspaceFilesystem,
@@ -108,6 +109,7 @@ impl Server {
                 store,
                 agents: options.agents,
                 sessions: Mutex::default(),
+                auth_connections: std::sync::Mutex::default(),
                 changes,
                 effects: Mutex::default(),
                 filesystem: crate::filesystem::WorkspaceFilesystem::default(),
@@ -127,6 +129,14 @@ impl Server {
             .route("/api/auth/session", get(session))
             .route("/api/auth/websocket-ticket", post(ticket))
             .route("/api/auth/pairing-token", post(pair))
+            .route("/api/auth/pairing-links", get(pairing_links))
+            .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
+            .route("/api/auth/clients", get(auth_clients))
+            .route("/api/auth/clients/revoke", post(revoke_auth_client))
+            .route(
+                "/api/auth/clients/revoke-others",
+                post(revoke_other_auth_clients),
+            )
             .route("/api/orchestration/shell", get(shell))
             .route("/api/orchestration/threads/{id}", get(compatible_thread))
             .route(
@@ -450,16 +460,16 @@ async fn exchange(
     uri: Uri,
     axum::Form(input): axum::Form<HashMap<String, String>>,
 ) -> ApiResult {
-    Ok(Json(
-        services
-            .store
-            .exchange(
-                &serde_json::to_value(input).map_err(anyhow::Error::from)?,
-                headers.get("dpop").and_then(|v| v.to_str().ok()),
-                &request_url(&headers, &uri)?,
-            )
-            .map_err(|error| ApiError::new(StatusCode::UNAUTHORIZED, error))?,
-    ))
+    let result = services
+        .store
+        .exchange(
+            &serde_json::to_value(input).map_err(anyhow::Error::from)?,
+            headers.get("dpop").and_then(|v| v.to_str().ok()),
+            &request_url(&headers, &uri)?,
+        )
+        .map_err(|error| ApiError::new(StatusCode::UNAUTHORIZED, error))?;
+    let _ = services.changes.send(json!({"authAccess":true}));
+    Ok(Json(result))
 }
 async fn session(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
     let mut result = authenticate(&s, &h, &u, "GET", None)?.metadata();
@@ -478,9 +488,79 @@ async fn pair(
     Json(input): Json<Value>,
 ) -> ApiResult {
     let session = authenticate(&s, &h, &u, "POST", Some("access:write"))?;
-    let scopes: Vec<String> =
-        serde_json::from_value(input["scopes"].clone()).map_err(anyhow::Error::from)?;
-    Ok(Json(s.store.delegate(&session, &scopes)?))
+    let scopes: Vec<String> = if input.get("scopes").is_some() {
+        serde_json::from_value(input["scopes"].clone()).map_err(anyhow::Error::from)?
+    } else {
+        auth::STANDARD_SCOPES
+            .iter()
+            .map(|scope| (*scope).into())
+            .collect()
+    };
+    let result = s.store.delegate(
+        &session,
+        &scopes,
+        input["label"]
+            .as_str()
+            .filter(|label| !label.trim().is_empty()),
+    )?;
+    let _ = s.changes.send(json!({"authAccess":true}));
+    Ok(Json(result))
+}
+async fn pairing_links(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
+    let session = authenticate(&s, &h, &u, "GET", Some("access:read"))?;
+    Ok(Json(
+        s.store
+            .auth_access(session.id(), &s.connected_session_ids()?)?["pairingLinks"]
+            .clone(),
+    ))
+}
+async fn revoke_pairing_link(
+    State(s): State<Arc<Services>>,
+    h: HeaderMap,
+    u: Uri,
+    Json(input): Json<Value>,
+) -> ApiResult {
+    authenticate(&s, &h, &u, "POST", Some("access:write"))?;
+    let revoked = s.store.revoke_pairing_link(required(&input, "id")?)?;
+    if revoked {
+        let _ = s.changes.send(json!({"authAccess":true}));
+    }
+    Ok(Json(json!({"revoked":revoked})))
+}
+async fn auth_clients(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
+    let session = authenticate(&s, &h, &u, "GET", Some("access:read"))?;
+    Ok(Json(
+        s.store
+            .auth_access(session.id(), &s.connected_session_ids()?)?["clientSessions"]
+            .clone(),
+    ))
+}
+async fn revoke_auth_client(
+    State(s): State<Arc<Services>>,
+    h: HeaderMap,
+    u: Uri,
+    Json(input): Json<Value>,
+) -> ApiResult {
+    let session = authenticate(&s, &h, &u, "POST", Some("access:write"))?;
+    let revoked = s
+        .store
+        .revoke_session(session.id(), required(&input, "sessionId")?)?;
+    if revoked {
+        let _ = s.changes.send(json!({"authAccess":true}));
+    }
+    Ok(Json(json!({"revoked":revoked})))
+}
+async fn revoke_other_auth_clients(
+    State(s): State<Arc<Services>>,
+    h: HeaderMap,
+    u: Uri,
+) -> ApiResult {
+    let session = authenticate(&s, &h, &u, "POST", Some("access:write"))?;
+    let revoked_count = s.store.revoke_other_sessions(session.id())?;
+    if revoked_count > 0 {
+        let _ = s.changes.send(json!({"authAccess":true}));
+    }
+    Ok(Json(json!({"revokedCount":revoked_count})))
 }
 async fn shell(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
     authenticate(&s, &h, &u, "GET", Some("orchestration:read"))?;
@@ -647,6 +727,49 @@ struct RpcSubscription {
     awaiting_ack: bool,
     dirty: bool,
 }
+impl Services {
+    fn connected_session_ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .auth_connections
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Auth connection lock poisoned"))?
+            .keys()
+            .cloned()
+            .collect())
+    }
+}
+struct AuthConnectionGuard {
+    services: Arc<Services>,
+    session_id: String,
+}
+impl AuthConnectionGuard {
+    fn open(services: Arc<Services>, session_id: String) -> Result<Self> {
+        *services
+            .auth_connections
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Auth connection lock poisoned"))?
+            .entry(session_id.clone())
+            .or_default() += 1;
+        let _ = services.changes.send(json!({"authAccess":true}));
+        Ok(Self {
+            services,
+            session_id,
+        })
+    }
+}
+impl Drop for AuthConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut connections) = self.services.auth_connections.lock()
+            && let Some(count) = connections.get_mut(&self.session_id)
+        {
+            *count -= 1;
+            if *count == 0 {
+                connections.remove(&self.session_id);
+            }
+        }
+        let _ = self.services.changes.send(json!({"authAccess":true}));
+    }
+}
 fn request_key(id: &Value) -> Option<String> {
     (id.is_string() || id.as_u64().is_some()).then(|| id.to_string())
 }
@@ -695,6 +818,10 @@ async fn flush_subscription(
     send_rpc(sender, response).await
 }
 async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
+    let _auth_connection = match AuthConnectionGuard::open(s.clone(), session.id().to_owned()) {
+        Ok(connection) => connection,
+        Err(_) => return,
+    };
     let (mut sender, mut receiver) = socket.split();
     let mut changes = s.changes.subscribe();
     let mut subscriptions = HashMap::<String, RpcSubscription>::new();
@@ -757,7 +884,8 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                 if !s.store.session_valid(session.id()).unwrap_or(false){break;}
                 for subscription in subscriptions.values_mut(){
                     let relevant=match subscription.tag.as_str() {
-                        "subscribeServerConfig" | "subscribeServerLifecycle" | "subscribeAuthAccess" | "provider.auth.subscribe" => false,
+                        "subscribeAuthAccess" => change["authAccess"] == true,
+                        "subscribeServerConfig" | "subscribeServerLifecycle" | "provider.auth.subscribe" => false,
                         "orchestration.subscribeShell" | "orchestration.subscribeArchivedShell" | "rust.subscribeEvents" => true,
                         _ => change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"],
                     };
@@ -817,9 +945,9 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         }
         "subscribeAuthAccess" => Ok(json!({
             "version":1,
-            "revision":0,
+            "revision":crate::auth::epoch(),
             "type":"snapshot",
-            "payload":{"pairingLinks":[],"clientSessions":[]}
+            "payload":s.store.auth_access(session.id(), &s.connected_session_ids()?)?
         })),
         "server.reportClientActivity" => Ok(Value::Null),
         "provider.auth.subscribe" => {

@@ -62,6 +62,25 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         .await?;
     assert_eq!(auth_state["auth"]["policy"], "remote-reachable");
     assert_eq!(auth_state["sessionMethod"], "bearer-access-token");
+    let pairing: Value = client
+        .post(format!("{base}/api/auth/pairing-token"))
+        .bearer_auth(access)
+        .json(&json!({"label":"Transport phone"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(pairing["label"], "Transport phone");
+    let pairing_links: Value = client
+        .get(format!("{base}/api/auth/pairing-links"))
+        .bearer_auth(access)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(pairing_links.as_array().unwrap().len(), 1);
     let missing = client
         .get(format!("{base}/api/orchestration/threads/missing/bounded"))
         .bearer_auth(access)
@@ -203,11 +222,116 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
     let access_state: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
     assert_eq!(access_state["requestId"], "access");
     assert_eq!(access_state["values"][0]["type"], "snapshot");
-    assert!(
+    assert_eq!(
         access_state["values"][0]["payload"]["clientSessions"]
             .as_array()
             .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        access_state["values"][0]["payload"]["pairingLinks"][0]["label"],
+        "Transport phone"
+    );
+    assert_eq!(
+        access_state["values"][0]["payload"]["clientSessions"][0]["current"],
+        true
+    );
+    assert_eq!(
+        access_state["values"][0]["payload"]["clientSessions"][0]["connected"],
+        true
+    );
+    socket
+        .send(Message::Text(
+            json!({"_tag":"Ack","requestId":"access"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    let second_token: Value = client
+        .post(format!("{base}/oauth/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            (
+                "subject_token_type",
+                "urn:t3:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+            ("subject_token", pairing["credential"].as_str().unwrap()),
+            ("client_label", "Transport phone"),
+            ("client_device_type", "mobile"),
+            ("client_os", "iOS"),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(second_token["access_token"].as_str().is_some());
+    let changed_access: Value = serde_json::from_str(
+        tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await?
+            .unwrap()?
+            .to_text()?,
+    )?;
+    assert_eq!(changed_access["requestId"], "access");
+    assert_eq!(
+        changed_access["values"][0]["payload"]["clientSessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        changed_access["values"][0]["payload"]["pairingLinks"]
+            .as_array()
+            .unwrap()
             .is_empty()
+    );
+    let other_session = changed_access["values"][0]["payload"]["clientSessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["current"] == false)
+        .unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    socket
+        .send(Message::Text(
+            json!({"_tag":"Ack","requestId":"access"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    let revoked: Value = client
+        .post(format!("{base}/api/auth/clients/revoke"))
+        .bearer_auth(access)
+        .json(&json!({"sessionId":other_session}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(revoked["revoked"], true);
+    let revoked_access: Value = serde_json::from_str(
+        tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await?
+            .unwrap()?
+            .to_text()?,
+    )?;
+    assert_eq!(
+        revoked_access["values"][0]["payload"]["clientSessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
     socket
         .send(Message::Text(

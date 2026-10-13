@@ -31,6 +31,22 @@ pub(crate) fn random_token() -> String {
 fn hash(token: &str) -> String {
     B64.encode(Sha256::digest(token.as_bytes()))
 }
+fn scope_response(scopes: &[String]) -> Value {
+    const LEGACY: &[&str] = &[
+        "orchestration:read",
+        "orchestration:operate",
+        "terminal:operate",
+        "access:read",
+        "access:write",
+        "relay:read",
+        "relay:write",
+    ];
+    let legacy = scopes
+        .iter()
+        .filter(|scope| LEGACY.contains(&scope.as_str()))
+        .collect::<Vec<_>>();
+    json!({"scopes":legacy,"permissions":scopes})
+}
 pub(crate) fn epoch() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -70,31 +86,74 @@ impl Store {
         ttl: i64,
         reusable: bool,
     ) -> Result<Value> {
+        self.issue_grant(
+            scopes,
+            proof_key,
+            ttl,
+            reusable,
+            "administrative-bootstrap",
+            None,
+        )
+    }
+
+    fn issue_grant(
+        &self,
+        scopes: &[String],
+        proof_key: Option<&str>,
+        ttl: i64,
+        reusable: bool,
+        subject: &str,
+        label: Option<&str>,
+    ) -> Result<Value> {
         ensure!(ttl > 0 && ttl <= 86400, "Invalid credential lifetime");
         let token = random_token();
         let expires = epoch() + ttl;
-        self.lock()?.execute(
+        let created = epoch();
+        let id = uuid::Uuid::new_v4().to_string();
+        let token_hash = hash(&token);
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        tx.execute(
             "INSERT INTO grants(hash,scopes,proof_key,expires,reusable) VALUES (?,?,?,?,?)",
             params![
-                hash(&token),
+                token_hash,
                 serde_json::to_string(scopes)?,
                 proof_key,
                 expires,
                 reusable
             ],
         )?;
-        Ok(
-            json!({"id":uuid::Uuid::new_v4().to_string(),"credential":token,"expiresAt":iso(expires),"scopes":scopes,"permissions":scopes}),
-        )
+        tx.execute(
+            "INSERT INTO grant_details(hash,id,subject,label,created) VALUES (?,?,?,?,?)",
+            params![token_hash, id, subject, label, created],
+        )?;
+        tx.commit()?;
+        let mut value = json!({"id":id,"credential":token,"expiresAt":iso(expires)});
+        if let Some(label) = label {
+            value["label"] = json!(label);
+        }
+        Ok(value)
     }
 
-    pub(crate) fn delegate(&self, session: &Session, scopes: &[String]) -> Result<Value> {
+    pub(crate) fn delegate(
+        &self,
+        session: &Session,
+        scopes: &[String],
+        label: Option<&str>,
+    ) -> Result<Value> {
         session.require("access:write")?;
         ensure!(!scopes.is_empty(), "At least one permission is required");
+        ensure!(
+            scopes
+                .iter()
+                .enumerate()
+                .all(|(index, scope)| !scopes[..index].contains(scope)),
+            "Permissions must be unique"
+        );
         for scope in scopes {
             session.require(scope)?;
         }
-        self.grant(scopes, None, 120, false)
+        self.issue_grant(scopes, None, 300, false, "one-time-token", label)
     }
 
     pub(crate) fn exchange(&self, input: &Value, proof: Option<&str>, url: &str) -> Result<Value> {
@@ -110,14 +169,15 @@ impl Store {
             .context("Missing bootstrap credential")?;
         let mut connection = self.lock()?;
         let tx = connection.transaction()?;
-        let grant: Option<(String, Option<String>, i64, bool)> = tx
+        let grant: Option<(String, Option<String>, i64, bool, String)> = tx
             .query_row(
-                "SELECT scopes,proof_key,expires,reusable FROM grants WHERE hash=?",
+                "SELECT g.scopes,g.proof_key,g.expires,g.reusable,COALESCE(d.subject,'client') FROM grants g LEFT JOIN grant_details d ON d.hash=g.hash WHERE g.hash=?",
                 [hash(token)],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        let (scopes, mut key, expires, reusable) = grant.context("Invalid bootstrap credential")?;
+        let (scopes, mut key, expires, reusable, subject) =
+            grant.context("Invalid bootstrap credential")?;
         ensure!(expires > epoch(), "Bootstrap credential expired");
         let granted: Vec<String> = serde_json::from_str(&scopes)?;
         let requested: Vec<String> = match input.get("scope") {
@@ -159,15 +219,36 @@ impl Store {
         }
         let access = random_token();
         let duration = 30 * 86400;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let issued = epoch();
+        let mut client = json!({
+            "deviceType":input["client_device_type"].as_str().unwrap_or("unknown")
+        });
+        if let Some(label) = input["client_label"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            client["label"] = json!(label);
+        }
+        if let Some(os) = input["client_os"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            client["os"] = json!(os);
+        }
         tx.execute(
             "INSERT INTO sessions(id,hash,scopes,proof_key,expires) VALUES (?,?,?,?,?)",
             params![
-                uuid::Uuid::new_v4().to_string(),
+                session_id,
                 hash(&access),
                 serde_json::to_string(&requested)?,
                 key,
                 epoch() + duration
             ],
+        )?;
+        tx.execute(
+            "INSERT INTO session_details(session_id,subject,client,issued,last_connected) VALUES (?,?,?,?,?)",
+            params![session_id, subject, client.to_string(), issued, issued],
         )?;
         tx.commit()?;
         Ok(
@@ -222,6 +303,10 @@ impl Store {
         } else {
             ensure!(scheme == "Bearer", "Token is not bound to a proof key");
         }
+        tx.execute(
+            "UPDATE session_details SET last_connected=? WHERE session_id=?",
+            params![epoch(), id],
+        )?;
         tx.commit()?;
         Ok(Session {
             id,
@@ -279,6 +364,115 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn auth_access(
+        &self,
+        current_session_id: &str,
+        connected_session_ids: &[String],
+    ) -> Result<Value> {
+        let connection = self.lock()?;
+        let current_time = epoch();
+        let pairing_links = {
+            let mut query = connection.prepare(
+                "SELECT d.id,g.scopes,d.subject,d.label,d.created,g.expires FROM grants g JOIN grant_details d ON d.hash=g.hash WHERE g.expires>? AND d.subject!='administrative-bootstrap' ORDER BY d.created DESC",
+            )?;
+            query
+                .query_map([current_time], |row| {
+                    let scopes: String = row.get(1)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        scopes,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })?
+                .map(|row| {
+                    let (id, scopes, subject, label, created, expires) = row?;
+                    let scopes: Vec<String> = serde_json::from_str(&scopes)?;
+                    let mut value = json!({
+                        "id":id,
+                        "subject":subject,
+                        "createdAt":iso(created),
+                        "expiresAt":iso(expires)
+                    });
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(scope_response(&scopes).as_object().unwrap().clone());
+                    if let Some(label) = label {
+                        value["label"] = json!(label);
+                    }
+                    Ok::<_, anyhow::Error>(value)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let client_sessions = {
+            let mut query = connection.prepare(
+                "SELECT s.id,s.scopes,s.proof_key,s.expires,COALESCE(d.subject,'client'),COALESCE(d.client,'{\"deviceType\":\"unknown\"}'),COALESCE(d.issued,s.expires-2592000),d.last_connected FROM sessions s LEFT JOIN session_details d ON d.session_id=s.id WHERE s.expires>? ORDER BY COALESCE(d.last_connected,d.issued,0) DESC",
+            )?;
+            query
+                .query_map([current_time], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                })?
+                .map(|row| {
+                    let (id, scopes, proof, expires, subject, client, issued, connected) = row?;
+                    let scopes: Vec<String> = serde_json::from_str(&scopes)?;
+                    let mut value = json!({
+                        "sessionId":id,
+                        "subject":subject,
+                        "method":if proof.is_some(){"dpop-access-token"}else{"bearer-access-token"},
+                        "client":serde_json::from_str::<Value>(&client)?,
+                        "issuedAt":iso(issued),
+                        "expiresAt":iso(expires),
+                        "lastConnectedAt":connected.map(iso),
+                        "connected":connected_session_ids.contains(&id),
+                        "current":id==current_session_id
+                    });
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(scope_response(&scopes).as_object().unwrap().clone());
+                    Ok::<_, anyhow::Error>(value)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(json!({"pairingLinks":pairing_links,"clientSessions":client_sessions}))
+    }
+
+    pub(crate) fn revoke_pairing_link(&self, id: &str) -> Result<bool> {
+        Ok(self.lock()?.execute(
+            "DELETE FROM grants WHERE hash=(SELECT hash FROM grant_details WHERE id=?)",
+            [id],
+        )? > 0)
+    }
+
+    pub(crate) fn revoke_session(&self, current: &str, target: &str) -> Result<bool> {
+        ensure!(
+            current != target,
+            "The current session cannot revoke itself"
+        );
+        Ok(self
+            .lock()?
+            .execute("DELETE FROM sessions WHERE id=?", [target])?
+            > 0)
+    }
+
+    pub(crate) fn revoke_other_sessions(&self, current: &str) -> Result<usize> {
+        Ok(self
+            .lock()?
+            .execute("DELETE FROM sessions WHERE id!=?", [current])?)
     }
 }
 
@@ -351,7 +545,7 @@ mod tests {
         assert!(session.require("orchestration:operate").is_err());
         assert!(
             store
-                .delegate(&session, &["orchestration:operate".into()])
+                .delegate(&session, &["orchestration:operate".into()], None)
                 .is_err()
         );
         Ok(())
