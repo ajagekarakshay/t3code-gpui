@@ -1,0 +1,19 @@
+[package]
+name = "t3-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+axum.workspace = true
+clap.workspace = true
+gpui-kit.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+t3-server = { path = "../server" }
+tokio.workspace = true
+uuid.workspace = true
+
