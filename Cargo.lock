@@ -7481,6 +7481,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "t3-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "t3-connect",
+ "t3-server",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "t3-connect"
 version = "0.1.0"
 dependencies = [
@@ -7508,6 +7528,7 @@ dependencies = [
  "gpui-kit",
  "reqwest",
  "serde_json",
+ "t3-client",
  "t3-server",
  "tempfile",
  "tokio",

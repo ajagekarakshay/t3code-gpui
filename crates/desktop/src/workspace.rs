@@ -2,6 +2,7 @@ use crate::backend::{self, Request, Update};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
+    clipboard::Clipboard,
     command::{Command, CommandItem, CommandState},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
@@ -13,7 +14,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::{Value, json};
 use std::{collections::HashMap, net::SocketAddr, rc::Rc, sync::Arc};
+use t3_client::SavedSession;
 use t3_server::Server;
+
+const CREDENTIAL_KEY: &str = "t3code://native/environments";
 
 actions!(
     t3,
@@ -93,6 +97,7 @@ pub(crate) struct Workspace {
     focus: FocusHandle,
     composer: Entity<TextareaState>,
     path: Entity<InputState>,
+    pairing: Entity<InputState>,
     palette: Entity<CommandState>,
     scroller: Entity<MessageScrollerState>,
     shell: Value,
@@ -109,6 +114,13 @@ pub(crate) struct Workspace {
     busy: bool,
     error: Option<SharedString>,
     address: SocketAddr,
+    environment_id: Option<String>,
+    environment_label: SharedString,
+    environment_connected: bool,
+    environment_scopes: Vec<String>,
+    saved_environments: Vec<SavedSession>,
+    pairing_link: Option<SharedString>,
+    _credentials: Task<()>,
 }
 
 impl Workspace {
@@ -129,6 +141,8 @@ impl Workspace {
         });
         let path =
             cx.new(|cx| InputState::new(window, cx).placeholder("Absolute project directory"));
+        let pairing =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Paste a T3 pairing link"));
         let palette = cx.new(|cx| CommandState::new(window, cx));
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let subscriptions = vec![
@@ -151,6 +165,30 @@ impl Workspace {
         });
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let credential_request = requests.clone();
+        let credentials = cx.read_credentials(CREDENTIAL_KEY);
+        let credential_task = cx.spawn(async move |this, cx| match credentials.await {
+            Ok(Some((_, bytes))) => match serde_json::from_slice::<Vec<SavedSession>>(&bytes) {
+                Ok(sessions) => {
+                    let _ = credential_request.send(Request::Restore(sessions)).await;
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.error =
+                            Some(format!("Could not read saved environments: {error}").into());
+                        cx.notify();
+                    });
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.error =
+                        Some(format!("Could not open the credential store: {error}").into());
+                    cx.notify();
+                });
+            }
+        });
         Self {
             requests,
             _backend: backend,
@@ -160,6 +198,7 @@ impl Workspace {
             focus,
             composer,
             path,
+            pairing,
             palette,
             scroller,
             shell: json!({}),
@@ -176,6 +215,13 @@ impl Workspace {
             busy: false,
             error: None,
             address,
+            environment_id: None,
+            environment_label: "Local environment".into(),
+            environment_connected: true,
+            environment_scopes: Vec::new(),
+            saved_environments: Vec::new(),
+            pairing_link: None,
+            _credentials: credential_task,
         }
     }
 
@@ -313,6 +359,40 @@ impl Workspace {
             Update::Failed(error) => {
                 self.busy = false;
                 self.error = Some(error.into());
+            }
+            Update::Environment {
+                id,
+                label,
+                connected,
+                scopes,
+            } => {
+                self.busy = false;
+                if connected {
+                    self.error = None;
+                }
+                self.environment_id = id;
+                self.environment_label = label.into();
+                self.environment_connected = connected;
+                self.environment_scopes = scopes;
+                self.selected_project = None;
+                self.selected_thread = None;
+                self.detail = json!({});
+                self.messages = Rc::default();
+                self.permissions.clear();
+            }
+            Update::Saved(sessions) => {
+                self.saved_environments = sessions;
+                match serde_json::to_vec(&self.saved_environments) {
+                    Ok(bytes) => cx
+                        .write_credentials(CREDENTIAL_KEY, "environments", &bytes)
+                        .detach(),
+                    Err(error) => {
+                        self.error = Some(format!("Could not save environments: {error}").into());
+                    }
+                }
+            }
+            Update::PairingLink(link) => {
+                self.pairing_link = Some(link.into());
             }
         }
         cx.notify();
@@ -586,6 +666,35 @@ impl Workspace {
     fn settings(&mut self, _: &ShowSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.page = Page::Settings;
         cx.notify();
+    }
+    fn pair_environment(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let link = self.pairing.read(cx).value().to_string();
+        if link.trim().is_empty() {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        self.request(Request::Pair(link), cx);
+    }
+    fn select_environment(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.error = None;
+        self.request(Request::Environment(id), cx);
+    }
+    fn forget_environment(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.request(Request::Forget(id), cx);
+    }
+    fn create_pairing_link(&mut self, cx: &mut Context<Self>) {
+        self.pairing_link = None;
+        self.request(Request::PairingLink(format!("http://{}", self.address)), cx);
     }
     fn commands(&mut self, _: &ShowCommands, window: &mut Window, cx: &mut Context<Self>) {
         let palette = self.palette.clone();
@@ -933,6 +1042,85 @@ impl Render for Workspace {
                 .flex()
                 .flex_col()
                 .child("Settings")
+                .child("Environment")
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("environment-local")
+                                .label("Local")
+                                .selected(self.environment_id.is_none())
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.select_environment(None, cx)),
+                                ),
+                        )
+                        .children(self.saved_environments.iter().map(|environment| {
+                            let id = environment.environment_id().to_owned();
+                            let selected = self.environment_id.as_deref() == Some(&id);
+                            Button::new(SharedString::from(format!("environment-{id}")))
+                                .label(environment.label().to_owned())
+                                .selected(selected)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_environment(Some(id.clone()), cx)
+                                }))
+                        })),
+                )
+                .child(format!(
+                    "{} · {}",
+                    self.environment_label,
+                    if self.environment_connected {
+                        "Connected"
+                    } else {
+                        "Reconnecting"
+                    }
+                ))
+                .when(!self.environment_scopes.is_empty(), |settings| {
+                    settings.child(format!(
+                        "Permissions: {}",
+                        self.environment_scopes.join(", ")
+                    ))
+                })
+                .when_some(self.environment_id.clone(), |settings, id| {
+                    settings.child(
+                        Button::new(SharedString::from(format!("forget-environment-{id}")))
+                            .label("Forget environment")
+                            .danger()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.forget_environment(id.clone(), cx)
+                            })),
+                    )
+                })
+                .child(Input::new(&self.pairing))
+                .child(
+                    Button::new("pair-environment")
+                        .label("Pair environment")
+                        .primary()
+                        .disabled(self.busy)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.pair_environment(window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("create-pairing-link")
+                        .label("Create local pairing link")
+                        .on_click(cx.listener(|this, _, _, cx| this.create_pairing_link(cx))),
+                )
+                .when_some(self.pairing_link.clone(), |settings, link| {
+                    settings.child("One-use link, valid for two minutes").child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(div().flex_1().min_w_0().child(link.clone()))
+                            .child(
+                                Clipboard::new("copy-local-pairing-link")
+                                    .value(link)
+                                    .tooltip("Copy pairing link"),
+                            ),
+                    )
+                })
                 .child("Agent for new threads")
                 .child(
                     div().flex().gap_2().children(
@@ -957,7 +1145,7 @@ impl Render for Workspace {
                         .child(control.label.clone())
                         .child(Select::new(&control.state).disabled(self.is_running()))
                 }))
-                .child(format!("Local environment: http://{}", self.address))
+                .child(format!("Local server: http://{}", self.address))
                 .child("Agents use their own installed credentials and configuration.")
                 .into_any_element(),
         };

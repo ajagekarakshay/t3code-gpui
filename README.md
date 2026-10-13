@@ -19,10 +19,18 @@ The adapters must be available as `claude-agent-acp` and `codex-acp` on `PATH`. 
 
 Add a project directory, create a thread, and send a prompt. The desktop runs its Rust environment server on an available loopback port. Agent configuration comes from the active ACP session. Command/Control-K opens the command palette; Command/Control-Enter sends a prompt.
 
+Settings can pair another native environment from a direct or hosted T3 pairing link. Sessions are proof-bound to the desktop, stored in the operating system credential store, and reconnect automatically. The desktop resumes from committed event sequence numbers so reconnecting does not drop streamed agent updates.
+
 The standalone development server is also available:
 
 ```sh
 cargo run -p t3-server -- --home-dir .t3/rust --listen 127.0.0.1:3773
+```
+
+To print a one-use link for another native desktop, add `--pair`. When listening on a LAN address or through a reverse proxy, pass the address clients actually use:
+
+```sh
+cargo run -p t3-server -- --home-dir .t3/rust --listen 0.0.0.0:3773 --pair --pair-origin https://machine.example.com
 ```
 
 Use a different data directory when running it alongside the desktop. Each Rust data directory has one server owner. The migration rejects the live `~/.t3` tree, and does not import or modify the existing installation's database.
@@ -30,9 +38,9 @@ Use a different data directory when running it alongside the desktop. Each Rust 
 ## Verify the native code
 
 ```sh
-cargo test -p t3-acp -p t3-connect -p t3-server --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked
+cargo test -p t3-acp -p t3-connect -p t3-client -p t3-server --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked
 cargo test -p t3-desktop --locked
-cargo clippy -p t3-acp -p t3-connect -p t3-server -p t3-desktop --all-targets --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked -- -D warnings
+cargo clippy -p t3-acp -p t3-connect -p t3-client -p t3-server -p t3-desktop --all-targets --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked -- -D warnings
 cargo build -p t3-desktop -p t3-server --locked
 ```
 

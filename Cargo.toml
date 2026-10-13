@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/acp", "crates/connect", "crates/server", "crates/desktop"]
-default-members = ["crates/acp", "crates/connect", "crates/server"]
+members = ["crates/acp", "crates/connect", "crates/client", "crates/server", "crates/desktop"]
+default-members = ["crates/acp", "crates/connect", "crates/client", "crates/server"]
 
 [workspace.package]
 version = "0.1.0"

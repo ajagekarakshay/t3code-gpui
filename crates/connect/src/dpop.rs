@@ -17,6 +17,15 @@ impl DpopKey {
             key: SigningKey::random(&mut rand::rngs::OsRng),
         }
     }
+    /// Only persist this material in the platform credential store.
+    pub fn private_key_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes().into()
+    }
+    pub fn from_private_key_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            key: SigningKey::from_slice(bytes)?,
+        })
+    }
     pub fn public_jwk(&self) -> Value {
         let point = self.key.verifying_key().to_encoded_point(false);
         json!({"kty":"EC","crv":"P-256","x":B64.encode(point.x().expect("uncompressed point")),"y":B64.encode(point.y().expect("uncompressed point"))})

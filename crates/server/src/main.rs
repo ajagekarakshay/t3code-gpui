@@ -10,6 +10,12 @@ struct Arguments {
     /// A separate Rust data directory is required during migration.
     #[arg(long, default_value = ".t3/rust")]
     home_dir: PathBuf,
+    /// Print a one-use pairing link valid for two minutes.
+    #[arg(long)]
+    pair: bool,
+    /// Public HTTP(S) origin to embed in `--pair` output.
+    #[arg(long, requires = "pair")]
+    pair_origin: Option<String>,
 }
 
 #[tokio::main]
@@ -25,6 +31,18 @@ async fn main() -> anyhow::Result<()> {
         "T3 Rust server listening at http://{}",
         listener.local_addr()?
     );
+    if arguments.pair {
+        let address = listener.local_addr()?;
+        let origin = arguments.pair_origin.unwrap_or_else(|| {
+            let host = if address.ip().is_unspecified() {
+                "127.0.0.1".to_owned()
+            } else {
+                address.ip().to_string()
+            };
+            format!("http://{host}:{}", address.port())
+        });
+        println!("{}", server.pairing_url(&origin)?);
+    }
     axum::serve(listener, server.router())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

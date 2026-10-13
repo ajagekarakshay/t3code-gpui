@@ -13,6 +13,7 @@ clap.workspace = true
 gpui-kit.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+t3-client = { path = "../client" }
 t3-server = { path = "../server" }
 tokio.workspace = true
 uuid.workspace = true

@@ -166,6 +166,30 @@ impl Server {
     pub fn shell(&self) -> Result<Value> {
         self.services.store.shell()
     }
+    pub fn pairing_url(&self, origin: &str) -> Result<String> {
+        let mut url = url::Url::parse(origin)?;
+        ensure!(
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none(),
+            "Invalid pairing origin"
+        );
+        let grant = self.services.store.grant(
+            &auth::STANDARD_SCOPES
+                .iter()
+                .chain(auth::ADMIN_SCOPES)
+                .map(|scope| scope.to_string())
+                .collect::<Vec<_>>(),
+            None,
+            120,
+            false,
+        )?;
+        url.set_path("/pair");
+        url.set_query(None);
+        url.set_fragment(Some(&format!("token={}", required(&grant, "credential")?)));
+        Ok(url.to_string())
+    }
     pub fn thread(&self, id: &str) -> Result<Value> {
         self.services.store.thread(id)
     }
@@ -466,14 +490,21 @@ async fn flush_subscription(
         return true;
     }
     let response = match rpc(s, session, &subscription.tag, &subscription.input).await {
-        Ok(value) => json!({"_tag":"Chunk","requestId":subscription.id,"values":[value]}),
+        Ok(value) => {
+            if subscription.tag == "rust.subscribeEvents" {
+                subscription.input["afterSequence"] = value["cursor"].clone();
+                subscription.dirty = value["hasMore"].as_bool().unwrap_or(false);
+            } else {
+                subscription.dirty = false;
+            }
+            json!({"_tag":"Chunk","requestId":subscription.id,"values":[value]})
+        }
         Err(error) => {
             let _ = send_rpc(sender, rpc_failure(&subscription.id, &error)).await;
             return false;
         }
     };
     subscription.awaiting_ack = true;
-    subscription.dirty = false;
     send_rpc(sender, response).await
 }
 async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
@@ -509,10 +540,13 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                     let id=&request["id"];
                     let Some(key)=request_key(id)else{continue};
                     let tag=request["tag"].as_str().unwrap_or_default();let input=&request["payload"];
-                    let streaming=matches!(tag,"orchestration.subscribeShell"|"rust.subscribeThread");
+                    let streaming=matches!(tag,"orchestration.subscribeShell"|"rust.subscribeThread"|"rust.subscribeEvents");
                     let response=match rpc(&s,&session,tag,input).await {
                         Ok(value) if streaming=>{
-                            subscriptions.insert(key,RpcSubscription{id:id.clone(),tag:tag.into(),input:input.clone(),awaiting_ack:true,dirty:false});
+                            let mut input=input.clone();
+                            let dirty=tag=="rust.subscribeEvents" && value["hasMore"]==true;
+                            if tag=="rust.subscribeEvents" {input["afterSequence"]=value["cursor"].clone();}
+                            subscriptions.insert(key,RpcSubscription{id:id.clone(),tag:tag.into(),input,awaiting_ack:true,dirty});
                             json!({"_tag":"Chunk","requestId":id,"values":[value]})
                         },
                         Ok(value)=>json!({"_tag":"Exit","requestId":id,"exit":{"_tag":"Success","value":value}}),
@@ -522,10 +556,10 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                 }
             }
             change=changes.recv()=>{
-                let Ok(change)=change else{break};
+                let change=match change { Ok(change)=>change, Err(broadcast::error::RecvError::Lagged(_))=>json!({}), Err(_)=>break };
                 if !s.store.session_valid(session.id()).unwrap_or(false){break;}
                 for subscription in subscriptions.values_mut(){
-                    let relevant=subscription.tag=="orchestration.subscribeShell" || change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"];
+                    let relevant=matches!(subscription.tag.as_str(),"orchestration.subscribeShell"|"rust.subscribeEvents") || change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"];
                     if relevant {
                         subscription.dirty=true;
                         if !flush_subscription(&s,&session,subscription,&mut sender).await{return;}
@@ -555,6 +589,11 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
             Ok(json!({"kind":"snapshot","snapshot":s.store.shell()?}))
         }
         "rust.getThread" | "rust.subscribeThread" => s.store.thread(required(input, "threadId")?),
+        "rust.eventsAfter" | "rust.subscribeEvents" => s.store.changes_after(
+            input["afterSequence"]
+                .as_i64()
+                .context("Invalid event cursor")?,
+        ),
         "rust.cancel" => {
             s.cancel(required(input, "threadId")?).await?;
             Ok(Value::Null)

@@ -161,6 +161,47 @@ impl Store {
         Ok(json!({"snapshotSequence":sequence,"thread":thread,"messages":messages}))
     }
 
+    /// Replay committed changes in bounded pages; the cursor advances only after delivery.
+    pub(crate) fn changes_after(&self, after: i64) -> Result<Value> {
+        ensure!(after >= 0, "Invalid event cursor");
+        let connection = self.lock()?;
+        let latest: i64 =
+            connection.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+        ensure!(after <= latest, "Event cursor is ahead of this environment");
+        let mut query = connection.prepare("SELECT sequence,thread_id,value FROM events WHERE sequence>? ORDER BY sequence LIMIT 256")?;
+        let rows = query.query_map([after], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut changes = Vec::new();
+        let mut bytes = 0;
+        let mut cursor = after;
+        for row in rows {
+            let (sequence, thread, value) = row?;
+            if !changes.is_empty() && bytes + value.len() > 512 * 1024 {
+                break;
+            }
+            bytes += value.len();
+            let event: Value = serde_json::from_str(&value)?;
+            let mut change = if event["type"] == "changed" {
+                event
+            } else {
+                // Older ACP rows predate replayable projections. Consumers refresh snapshots.
+                json!({"type":"changed","event":event})
+            };
+            change["sequence"] = json!(sequence);
+            change["threadId"] = json!(thread);
+            changes.push(change);
+            cursor = sequence;
+        }
+        Ok(json!({"changes":changes,"cursor":cursor,"hasMore":cursor < latest}))
+    }
+
     pub(crate) fn dispatch(&self, command: &Value) -> Result<Value> {
         let command_id = required(command, "commandId")?;
         let kind = required(command, "type")?;
@@ -480,11 +521,12 @@ impl Store {
         }
         thread["updatedAt"] = json!(timestamp);
         write_record(&tx, "threads", thread_id, &thread)?;
-        let sequence = append_event(&tx, Some(thread_id), None, event)?;
+        let mut change =
+            json!({"type":"changed","threadId":thread_id,"thread":thread,"agentEvent":event});
+        let sequence = append_event(&tx, Some(thread_id), None, &change)?;
         tx.commit()?;
-        Ok(
-            json!({"type":"changed","threadId":thread_id,"thread":thread,"sequence":sequence,"agentEvent":event}),
-        )
+        change["sequence"] = json!(sequence);
+        Ok(change)
     }
 }
 

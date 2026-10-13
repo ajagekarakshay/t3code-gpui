@@ -49,10 +49,10 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Environment and ACP tests
-        run: cargo test -p t3-acp -p t3-connect -p t3-server --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked
+        run: cargo test -p t3-acp -p t3-connect -p t3-client -p t3-server --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked
       - name: Headless desktop interaction tests
         run: cargo test -p t3-desktop --locked
       - name: Lint
-        run: cargo clippy -p t3-acp -p t3-connect -p t3-server -p t3-desktop --all-targets --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked -- -D warnings
+        run: cargo clippy -p t3-acp -p t3-connect -p t3-client -p t3-server -p t3-desktop --all-targets --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked -- -D warnings
       - name: Build native binaries
         run: cargo build -p t3-desktop -p t3-server --locked
