@@ -61,7 +61,9 @@ struct Row {
 #[derive(Clone)]
 struct ChatMessage {
     id: SharedString,
+    run_id: Option<SharedString>,
     role: SharedString,
+    status: SharedString,
     text: SharedString,
     tool: Option<Value>,
     tool_text: SharedString,
@@ -353,9 +355,17 @@ impl Workspace {
                     .flatten()
                     .map(|message| ChatMessage {
                         id: message["id"].as_str().unwrap_or_default().to_owned().into(),
+                        run_id: message["runId"]
+                            .as_str()
+                            .map(|value| SharedString::from(value.to_owned())),
                         role: message["role"]
                             .as_str()
                             .unwrap_or("assistant")
+                            .to_owned()
+                            .into(),
+                        status: message["runStatus"]
+                            .as_str()
+                            .unwrap_or_default()
                             .to_owned()
                             .into(),
                         text: message["text"]
@@ -535,7 +545,9 @@ impl Workspace {
                 } else {
                     messages.push(ChatMessage {
                         id: id.into(),
+                        run_id: (!run.is_empty()).then(|| SharedString::from(run.to_owned())),
                         role: "assistant".into(),
+                        status: "running".into(),
                         text: text.to_owned().into(),
                         tool: None,
                         tool_text: SharedString::default(),
@@ -553,7 +565,13 @@ impl Workspace {
                     .unwrap_or_else(|| {
                         messages.push(ChatMessage {
                             id: id.into(),
+                            run_id: (!run.is_empty()).then(|| SharedString::from(run.to_owned())),
                             role: "tool".into(),
+                            status: update["status"]
+                                .as_str()
+                                .unwrap_or("pending")
+                                .to_owned()
+                                .into(),
                             text: "".into(),
                             tool: Some(json!({})),
                             tool_text: SharedString::default(),
@@ -735,7 +753,7 @@ impl Workspace {
         let _ = window;
     }
     fn send_prompt(&mut self, _: &SendPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.is_running() {
+        if self.busy {
             return;
         }
         if let Some(thread) = self.selected_thread.clone() {
@@ -743,8 +761,21 @@ impl Workspace {
             if text.trim().is_empty() {
                 return;
             }
-            self.dispatch(json!({"type":"message.dispatch","threadId":thread,"messageId":uuid::Uuid::new_v4().to_string(),"text":text,"attachments":[],"dispatchMode":{"type":"start_immediately"}}),None,true,cx);
+            self.dispatch(
+                prompt_command(thread, text, self.is_running()),
+                None,
+                true,
+                cx,
+            );
         }
+    }
+    fn cancel_queued(&mut self, thread: String, run_id: String, cx: &mut Context<Self>) {
+        self.dispatch(
+            json!({"type":"queued-run.cancel","threadId":thread,"runId":run_id}),
+            None,
+            false,
+            cx,
+        );
     }
     fn stop_turn(&mut self, _: &StopTurn, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.selected_thread.clone() {
@@ -948,10 +979,20 @@ impl Workspace {
                 .into_any_element();
         }
         let messages = self.messages.clone();
+        let workspace = cx.entity().downgrade();
         let running = self.is_running();
         let mut content = div().flex().flex_col().flex_1().min_h_0().min_w_0().child(
             MessageScroller::new("conversation", self.scroller.clone(), move |ix, _, cx| {
                 let message = &messages[ix];
+                let queued = message.status.as_ref() == "queued";
+                let show_status = matches!(
+                    message.status.as_ref(),
+                    "queued" | "cancelled" | "failed" | "interrupted"
+                );
+                let thread = message
+                    .run_id
+                    .as_ref()
+                    .map(|run_id| (message.id.clone(), run_id.to_string()));
                 div()
                     .id((ElementId::from("message"), message.id.clone()))
                     .p_4()
@@ -960,10 +1001,30 @@ impl Workspace {
                     .flex_col()
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(message.role.clone()),
+                            .child(message.role.clone())
+                            .when(show_status, |header| header.child(message.status.clone())),
                     )
+                    .when_some(thread.filter(|_| queued), |this, (message_id, run_id)| {
+                        let workspace = workspace.clone();
+                        this.child(
+                            Button::new((ElementId::from("cancel-queued"), message_id))
+                                .label("Cancel queued prompt")
+                                .small()
+                                .ghost()
+                                .on_click(move |_, _, cx| {
+                                    let _ = workspace.update(cx, |this, cx| {
+                                        if let Some(thread) = this.selected_thread.clone() {
+                                            this.cancel_queued(thread, run_id.clone(), cx);
+                                        }
+                                    });
+                                }),
+                        )
+                    })
                     .when_some(message.tool.as_ref(), |this, tool| {
                         this.child(
                             div()
@@ -1082,9 +1143,30 @@ impl Workspace {
                                     .child(if running { "Agent is working" } else { "Ready" }),
                             )
                             .child(if running {
-                                Button::new("stop").label("Stop").on_click(cx.listener(
-                                    |this, _, window, cx| this.stop_turn(&StopTurn, window, cx),
-                                ))
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(Button::new("stop").label("Stop").on_click(cx.listener(
+                                        |this, _, window, cx| this.stop_turn(&StopTurn, window, cx),
+                                    )))
+                                    .child(
+                                        Button::new("queue")
+                                            .label("Queue")
+                                            .primary()
+                                            .disabled(
+                                                self.busy
+                                                    || self
+                                                        .composer
+                                                        .read(cx)
+                                                        .value()
+                                                        .trim()
+                                                        .is_empty(),
+                                            )
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.send_prompt(&SendPrompt, window, cx)
+                                            })),
+                                    )
+                                    .into_any_element()
                             } else {
                                 Button::new("send")
                                     .label("Send")
@@ -1096,11 +1178,29 @@ impl Workspace {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.send_prompt(&SendPrompt, window, cx)
                                     }))
+                                    .into_any_element()
                             }),
                     ),
             )
             .into_any_element()
     }
+}
+
+fn prompt_command(thread: String, text: String, queued: bool) -> Value {
+    let mut command = json!({
+        "type":"message.dispatch",
+        "threadId":thread,
+        "messageId":uuid::Uuid::new_v4().to_string(),
+        "text":text,
+        "attachments":[],
+        "createdBy":"user",
+        "creationSource":"web",
+        "dispatchMode":{"type":if queued {"queue_after_active"} else {"start_immediately"}}
+    });
+    if queued {
+        command["deliveryIntent"] = json!("auto");
+    }
+    command
 }
 
 fn tool_output(tool: &Value) -> SharedString {
@@ -1446,11 +1546,23 @@ impl Drop for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{Page, Workspace};
+    use super::{Page, Workspace, prompt_command};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size};
     use std::sync::Arc;
     use t3_server::{Server, ServerOptions};
+
+    #[test]
+    fn active_turn_prompts_use_the_server_queue_contract() {
+        let queued = prompt_command("thread".into(), "follow up".into(), true);
+        assert_eq!(queued["createdBy"], "user");
+        assert_eq!(queued["creationSource"], "web");
+        assert_eq!(queued["deliveryIntent"], "auto");
+        assert_eq!(queued["dispatchMode"]["type"], "queue_after_active");
+        let immediate = prompt_command("thread".into(), "start".into(), false);
+        assert!(immediate.get("deliveryIntent").is_none());
+        assert_eq!(immediate["dispatchMode"]["type"], "start_immediately");
+    }
 
     #[gpui_kit::test]
     fn command_palette_routes_to_settings_and_changes_the_agent(cx: &mut TestAppContext) {
