@@ -160,6 +160,36 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
                 .into(),
         ))
         .await?;
+    socket.send(Message::Text(json!([
+        {"_tag":"Request","id":"lifecycle","tag":"subscribeServerLifecycle","payload":{},"headers":[]},
+        {"_tag":"Request","id":"access","tag":"subscribeAuthAccess","payload":{},"headers":[]}
+    ]).to_string().into())).await?;
+    let lifecycle: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(lifecycle["requestId"], "lifecycle");
+    assert_eq!(lifecycle["values"][0]["type"], "welcome");
+    assert_eq!(
+        lifecycle["values"][0]["payload"]["bootstrapStatus"],
+        "complete"
+    );
+    let access_state: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(access_state["requestId"], "access");
+    assert_eq!(access_state["values"][0]["type"], "snapshot");
+    assert!(
+        access_state["values"][0]["payload"]["clientSessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    socket
+        .send(Message::Text(
+            json!([
+                {"_tag":"Interrupt","requestId":"lifecycle"},
+                {"_tag":"Interrupt","requestId":"access"}
+            ])
+            .to_string()
+            .into(),
+        ))
+        .await?;
     socket.send(Message::Text(json!({"_tag":"Request","id":9,"tag":"orchestration.subscribeShell","payload":{},"headers":[]}).to_string().into())).await?;
     let initial: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
     assert_eq!(initial["requestId"], 9);

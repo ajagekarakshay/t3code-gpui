@@ -730,6 +730,9 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                         | "orchestration.subscribeArchivedShell"
                         | "orchestration.subscribeThread"
                         | "subscribeServerConfig"
+                        | "subscribeServerLifecycle"
+                        | "subscribeAuthAccess"
+                        | "provider.auth.subscribe"
                         | "rust.subscribeThread"
                         | "rust.subscribeEvents"
                     );
@@ -752,7 +755,7 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                 if !s.store.session_valid(session.id()).unwrap_or(false){break;}
                 for subscription in subscriptions.values_mut(){
                     let relevant=match subscription.tag.as_str() {
-                        "subscribeServerConfig" => false,
+                        "subscribeServerConfig" | "subscribeServerLifecycle" | "subscribeAuthAccess" | "provider.auth.subscribe" => false,
                         "orchestration.subscribeShell" | "orchestration.subscribeArchivedShell" | "rust.subscribeEvents" => true,
                         _ => change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"],
                     };
@@ -767,7 +770,11 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
 }
 async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> Result<Value> {
     let scope = match tag {
-        "rust.configureAgent" | "rust.authenticateAgent" => "providers:manage",
+        "subscribeAuthAccess" => "access:read",
+        "rust.configureAgent"
+        | "rust.authenticateAgent"
+        | "provider.auth.subscribe"
+        | "server.refreshProviders" => "providers:manage",
         "orchestration.dispatchCommand"
         | "orchestration.launchThread"
         | "projects.mutate"
@@ -781,6 +788,57 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         "server.getConfig" => s.server_config(),
         "subscribeServerConfig" => {
             Ok(json!({"version":1,"type":"snapshot","config":s.server_config()?}))
+        }
+        "subscribeServerLifecycle" => {
+            let cwd = std::env::current_dir()?;
+            let project_name = cwd
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("T3 Code");
+            Ok(json!({
+                "version":1,
+                "sequence":0,
+                "type":"welcome",
+                "payload":{
+                    "environment":s.descriptor,
+                    "cwd":cwd.to_string_lossy(),
+                    "projectName":project_name,
+                    "bootstrapStatus":"complete"
+                }
+            }))
+        }
+        "subscribeAuthAccess" => Ok(json!({
+            "version":1,
+            "revision":0,
+            "type":"snapshot",
+            "payload":{"pairingLinks":[],"clientSessions":[]}
+        })),
+        "server.reportClientActivity" => Ok(Value::Null),
+        "provider.auth.subscribe" => {
+            let instance_id = required(input, "instanceId")?;
+            ensure!(
+                s.agents.contains_key(instance_id),
+                "Unknown provider instance"
+            );
+            Ok(json!({
+                "instanceId":instance_id,
+                "phase":"idle",
+                "flowId":null,
+                "authorizationUrl":null,
+                "expiresAt":null,
+                "message":null,
+                "credentialOwner":"provider"
+            }))
+        }
+        "server.refreshProviders" => {
+            if let Some(instance_id) = input["instanceId"].as_str() {
+                ensure!(
+                    s.agents.contains_key(instance_id),
+                    "Unknown provider instance"
+                );
+            }
+            Ok(json!({}))
         }
         "projects.list" => {
             Ok(json!({"projects":s.store.shell()?["projects"],"updatedAt":crate::store::now()}))
