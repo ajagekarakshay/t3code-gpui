@@ -282,7 +282,8 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         .await?;
     socket.send(Message::Text(json!([
         {"_tag":"Request","id":"config","tag":"server.getConfig","payload":{},"headers":[]},
-        {"_tag":"Request","id":"thread-subscription","tag":"orchestration.subscribeThread","payload":{"threadId":"thread"},"headers":[]}
+        {"_tag":"Request","id":"thread-subscription","tag":"orchestration.subscribeThread","payload":{"threadId":"thread"},"headers":[]},
+        {"_tag":"Request","id":"refresh-providers","tag":"server.refreshProviders","payload":{},"headers":[]}
     ]).to_string().into())).await?;
     let config: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
     assert_eq!(config["requestId"], "config");
@@ -301,6 +302,14 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
     assert_eq!(thread["requestId"], "thread-subscription");
     assert_eq!(thread["values"][0]["kind"], "snapshot");
     assert_eq!(thread["values"][0]["projection"]["thread"]["id"], "thread");
+    let refreshed: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(refreshed["requestId"], "refresh-providers");
+    assert!(refreshed["exit"]["value"]["providers"][0]["installed"].is_boolean());
+    assert!(
+        refreshed["exit"]["value"]["providers"][0]["version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
+    );
     socket
         .send(Message::Text(
             json!({"_tag":"Interrupt","requestId":"thread-subscription"})

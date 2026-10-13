@@ -368,34 +368,43 @@ fn server_auth_descriptor() -> Value {
 }
 
 impl Services {
-    fn server_config(&self) -> Result<Value> {
+    fn provider_snapshots(&self) -> Vec<Value> {
         let checked_at = crate::store::now();
-        let providers = self
-            .agents
-            .keys()
-            .map(|instance_id| {
+        self.agents
+            .iter()
+            .map(|(instance_id, command)| {
                 let (driver, display_name) = if instance_id == "claude-code" {
                     ("claude-agent", "Claude Code")
                 } else {
                     (instance_id.as_str(), "Codex")
                 };
-                json!({
+                let installed = t3_acp::command_available(command);
+                let mut provider = json!({
                     "instanceId":instance_id,
                     "driver":driver,
                     "displayName":display_name,
                     "supportedRuntimeModes":["full-access"],
                     "enabled":true,
-                    "installed":true,
-                    "version":null,
-                    "status":"ready",
+                    "installed":installed,
+                    "version":if instance_id == "claude-code" {"0.89.1"} else {"2.2.2"},
+                    "status":if installed {"ready"} else {"error"},
                     "auth":{"status":"unknown"},
                     "checkedAt":checked_at,
                     "models":[{"slug":"default","name":"Default","isCustom":false,"isDefault":true,"capabilities":null}],
                     "slashCommands":[],
-                    "skills":[]
-                })
+                    "skills":[],
+                    "setup":{"canAuthenticate":true,"canInstall":false}
+                });
+                if !installed {
+                    provider["message"] = json!("npx is required to run the maintained ACP adapter");
+                }
+                provider
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn server_config(&self) -> Result<Value> {
+        let providers = self.provider_snapshots();
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
         Ok(json!({
             "environment":self.descriptor,
@@ -928,7 +937,8 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                 for subscription in subscriptions.values_mut(){
                     let relevant=match subscription.tag.as_str() {
                         "subscribeAuthAccess" => change["authAccess"] == true,
-                        "subscribeServerConfig" | "subscribeServerLifecycle" | "provider.auth.subscribe" => false,
+                        "subscribeServerConfig" => change["serverConfig"] == true,
+                        "subscribeServerLifecycle" | "provider.auth.subscribe" => false,
                         "subscribeVcsStatus" => change["vcsCwd"] == subscription.input["cwd"],
                         "orchestration.subscribeShell" | "orchestration.subscribeArchivedShell" | "rust.subscribeEvents" => true,
                         "orchestration.searchThreadStream" => change["threadId"]==subscription.input["threadId"],
@@ -1027,7 +1037,9 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
                     "Unknown provider instance"
                 );
             }
-            Ok(json!({}))
+            let providers = s.provider_snapshots();
+            let _ = s.changes.send(json!({"serverConfig":true}));
+            Ok(json!({"providers":providers}))
         }
         "projects.list" => {
             Ok(json!({"projects":s.store.shell()?["projects"],"updatedAt":crate::store::now()}))
