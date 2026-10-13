@@ -21,7 +21,9 @@ dotenvy = "0.15"
 flate2 = "1"
 futures = "0.3"
 gpui-kit = "=0.7.3"
+ignore = "0.4"
 rand = "0.8"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

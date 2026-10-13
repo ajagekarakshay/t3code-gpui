@@ -3,6 +3,7 @@
 mod activity;
 mod auth;
 mod cloud;
+mod filesystem;
 mod home;
 mod http;
 mod relay_client;

@@ -56,6 +56,7 @@ pub(crate) struct Services {
     pub(crate) sessions: Mutex<HashMap<String, AgentSession>>,
     pub(crate) changes: broadcast::Sender<Value>,
     pub(crate) effects: Mutex<()>,
+    pub(crate) filesystem: crate::filesystem::WorkspaceFilesystem,
     pub(crate) tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub(crate) identity: EnvironmentIdentity,
     pub(crate) descriptor: Value,
@@ -109,6 +110,7 @@ impl Server {
                 sessions: Mutex::default(),
                 changes,
                 effects: Mutex::default(),
+                filesystem: crate::filesystem::WorkspaceFilesystem::default(),
                 tasks: Mutex::default(),
                 identity,
                 descriptor,
@@ -771,6 +773,11 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
 async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> Result<Value> {
     let scope = match tag {
         "subscribeAuthAccess" => "access:read",
+        "projects.writeFile" => "filesystem:write",
+        "projects.listEntries"
+        | "projects.readFile"
+        | "projects.searchContents"
+        | "projects.searchEntries" => "filesystem:read",
         "rust.configureAgent"
         | "rust.authenticateAgent"
         | "provider.auth.subscribe"
@@ -842,6 +849,19 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         }
         "projects.list" => {
             Ok(json!({"projects":s.store.shell()?["projects"],"updatedAt":crate::store::now()}))
+        }
+        "projects.listEntries" => {
+            crate::filesystem::list_entries(s.filesystem.clone(), input.clone()).await
+        }
+        "projects.readFile" => crate::filesystem::read_file(input.clone()).await,
+        "projects.searchContents" => {
+            crate::filesystem::search_contents(s.filesystem.clone(), input.clone()).await
+        }
+        "projects.searchEntries" => {
+            crate::filesystem::search_entries(s.filesystem.clone(), input.clone()).await
+        }
+        "projects.writeFile" => {
+            crate::filesystem::write_file(s.filesystem.clone(), input.clone()).await
         }
         "orchestration.dispatchCommand" | "projects.mutate" => s.dispatch(input.clone()).await,
         "orchestration.launchThread" => s.launch_thread(input).await,

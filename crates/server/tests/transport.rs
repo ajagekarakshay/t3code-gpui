@@ -7,6 +7,12 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 #[tokio::test]
 async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
     let directory = tempfile::tempdir()?;
+    let workspace = tempfile::tempdir()?;
+    std::fs::create_dir(workspace.path().join("src"))?;
+    std::fs::write(
+        workspace.path().join("src/lib.rs"),
+        "pub fn transport_contract() {}\n",
+    )?;
     let server = Server::open(ServerOptions::new(directory.path()))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -79,11 +85,34 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
     );
     let (mut socket, _) = connect_async(&url).await?;
     assert!(connect_async(&url).await.is_err());
-    socket.send(Message::Text(json!({"_tag":"Request","id":"request-1","tag":"projects.mutate","payload":{"type":"project.create","commandId":"command","projectId":"project","title":"Transport test","workspaceRoot":directory.path()},"headers":[]}).to_string().into())).await?;
+    socket.send(Message::Text(json!({"_tag":"Request","id":"request-1","tag":"projects.mutate","payload":{"type":"project.create","commandId":"command","projectId":"project","title":"Transport test","workspaceRoot":workspace.path()},"headers":[]}).to_string().into())).await?;
     let response: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
     assert_eq!(response["_tag"], "Exit");
     assert_eq!(response["requestId"], "request-1");
     assert_eq!(response["exit"]["_tag"], "Success");
+    socket.send(Message::Text(json!([
+        {"_tag":"Request","id":"write","tag":"projects.writeFile","payload":{"cwd":workspace.path(),"relativePath":"notes/status.md","contents":"filesystem ready"},"headers":[]},
+        {"_tag":"Request","id":"read","tag":"projects.readFile","payload":{"cwd":workspace.path(),"relativePath":"src/lib.rs"},"headers":[]},
+        {"_tag":"Request","id":"paths","tag":"projects.searchEntries","payload":{"cwd":workspace.path(),"query":"lib","limit":20},"headers":[]},
+        {"_tag":"Request","id":"contents","tag":"projects.searchContents","payload":{"cwd":workspace.path(),"query":"transport_contract","limit":20,"caseSensitive":true,"wholeWord":true,"useRegex":false},"headers":[]},
+        {"_tag":"Request","id":"list","tag":"projects.listEntries","payload":{"cwd":workspace.path(),"directoryPath":"src"},"headers":[]}
+    ]).to_string().into())).await?;
+    let write: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(write["exit"]["value"]["relativePath"], "notes/status.md");
+    let read: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(read["exit"]["value"]["truncated"], false);
+    assert!(
+        read["exit"]["value"]["contents"]
+            .as_str()
+            .unwrap()
+            .contains("transport_contract")
+    );
+    let paths: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(paths["exit"]["value"]["entries"][0]["path"], "src/lib.rs");
+    let contents: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(contents["exit"]["value"]["matches"][0]["lineNumber"], 1);
+    let list: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(list["exit"]["value"]["entries"][0]["path"], "src/lib.rs");
     let snapshot: Value = client
         .get(format!("{base}/api/orchestration/shell"))
         .bearer_auth(access)
