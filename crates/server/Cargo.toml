@@ -38,7 +38,7 @@ tokio-tungstenite.workspace = true
 
 
 [features]
-test-support = []
+test-support = ["t3-connect/test-support"]
 
 [[bin]]
 name = "t3-server-acp-fixture"

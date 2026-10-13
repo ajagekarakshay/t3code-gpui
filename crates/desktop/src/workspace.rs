@@ -1,4 +1,5 @@
 use crate::backend::{self, Request, Update};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
@@ -15,9 +16,11 @@ use gpui_kit::*;
 use serde_json::{Value, json};
 use std::{collections::HashMap, net::SocketAddr, rc::Rc, sync::Arc};
 use t3_client::SavedSession;
+use t3_connect::{AccountClient, AccountCredential};
 use t3_server::Server;
 
 const CREDENTIAL_KEY: &str = "t3code://native/environments";
+const CONNECT_CREDENTIAL_KEY: &str = "t3code://native/connect-account";
 
 actions!(
     t3,
@@ -120,7 +123,13 @@ pub(crate) struct Workspace {
     environment_scopes: Vec<String>,
     saved_environments: Vec<SavedSession>,
     pairing_link: Option<SharedString>,
+    connect_available: bool,
+    connect_linked: bool,
+    connect_identity: Option<SharedString>,
+    connect_status: SharedString,
+    connect_prompt: Option<(SharedString, SharedString)>,
     _credentials: Task<()>,
+    _connect_credentials: Task<()>,
 }
 
 impl Workspace {
@@ -128,12 +137,19 @@ impl Workspace {
         server: Server,
         runtime: Arc<tokio::runtime::Runtime>,
         address: SocketAddr,
+        connect: Option<AccountClient>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let (requests, request_receiver) = async_channel::bounded(32);
         let (updates, update_receiver) = async_channel::bounded(256);
-        let backend = runtime.spawn(backend::run(server, request_receiver, updates));
+        let backend = runtime.spawn(backend::run(
+            server,
+            request_receiver,
+            updates,
+            address,
+            connect,
+        ));
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Ask your agent to work on this project…")
@@ -189,6 +205,35 @@ impl Workspace {
                 });
             }
         });
+        let connect_request = requests.clone();
+        let connect_credentials = cx.read_credentials(CONNECT_CREDENTIAL_KEY);
+        let connect_credential_task =
+            cx.spawn(async move |this, cx| match connect_credentials.await {
+                Ok(Some((_, bytes))) => match serde_json::from_slice::<AccountCredential>(&bytes) {
+                    Ok(credential) => {
+                        let _ = connect_request
+                            .send(Request::RestoreConnect(Some(credential)))
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.error =
+                                Some(format!("Could not read T3 Connect account: {error}").into());
+                            cx.notify();
+                        });
+                    }
+                },
+                Ok(None) => {
+                    let _ = connect_request.send(Request::RestoreConnect(None)).await;
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.error =
+                            Some(format!("Could not open the credential store: {error}").into());
+                        cx.notify();
+                    });
+                }
+            });
         Self {
             requests,
             _backend: backend,
@@ -221,7 +266,13 @@ impl Workspace {
             environment_scopes: Vec::new(),
             saved_environments: Vec::new(),
             pairing_link: None,
+            connect_available: false,
+            connect_linked: false,
+            connect_identity: None,
+            connect_status: "Loading…".into(),
+            connect_prompt: None,
             _credentials: credential_task,
+            _connect_credentials: connect_credential_task,
         }
     }
 
@@ -394,6 +445,35 @@ impl Workspace {
             Update::PairingLink(link) => {
                 self.pairing_link = Some(link.into());
             }
+            Update::Connect {
+                available,
+                linked,
+                identity,
+                status,
+            } => {
+                self.connect_available = available;
+                self.connect_linked = linked;
+                self.connect_identity = identity.map(Into::into);
+                if status != "Waiting for browser authorization…" {
+                    self.connect_prompt = None;
+                }
+                self.connect_status = status.into();
+            }
+            Update::ConnectPrompt { url, code } => {
+                self.connect_prompt = Some((url.into(), code.into()));
+            }
+            Update::SaveConnect(credential) => match credential {
+                Some(credential) => match serde_json::to_vec(&credential) {
+                    Ok(bytes) => cx
+                        .write_credentials(CONNECT_CREDENTIAL_KEY, "account", &bytes)
+                        .detach(),
+                    Err(error) => {
+                        self.error =
+                            Some(format!("Could not save T3 Connect account: {error}").into());
+                    }
+                },
+                None => cx.delete_credentials(CONNECT_CREDENTIAL_KEY).detach(),
+            },
         }
         cx.notify();
     }
@@ -695,6 +775,22 @@ impl Workspace {
     fn create_pairing_link(&mut self, cx: &mut Context<Self>) {
         self.pairing_link = None;
         self.request(Request::PairingLink(format!("http://{}", self.address)), cx);
+    }
+    fn start_connect(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.connect_status = "Connecting…".into();
+        self.request(Request::StartConnect, cx);
+    }
+    fn cancel_connect(&mut self, cx: &mut Context<Self>) {
+        self.request(Request::CancelConnect, cx);
+    }
+    fn unlink_connect(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.connect_status = "Disconnecting…".into();
+        self.request(Request::UnlinkConnect, cx);
+    }
+    fn forget_connect_account(&mut self, cx: &mut Context<Self>) {
+        self.request(Request::ForgetConnectAccount, cx);
     }
     fn commands(&mut self, _: &ShowCommands, window: &mut Window, cx: &mut Context<Self>) {
         let palette = self.palette.clone();
@@ -1037,6 +1133,9 @@ impl Render for Workspace {
                 )
                 .into_any_element(),
             Page::Settings => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
                 .p_6()
                 .gap_4()
                 .flex()
@@ -1121,6 +1220,90 @@ impl Render for Workspace {
                             ),
                     )
                 })
+                .child("T3 Connect")
+                .child(self.connect_status.clone())
+                .when_some(self.connect_identity.clone(), |settings, identity| {
+                    settings.child(format!("Account: {identity}"))
+                })
+                .when(!self.connect_available, |settings| {
+                    settings.child(
+                        "Set the public T3 Connect variables from .env.example and restart the app.",
+                    )
+                })
+                .when_some(self.connect_prompt.clone(), |settings, (url, code)| {
+                    settings.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child("Open the verification page in a browser and enter this code:")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(code.clone())
+                                    .child(
+                                        Clipboard::new("copy-connect-code")
+                                            .value(code)
+                                            .tooltip("Copy authorization code"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .child(div().flex_1().min_w_0().child(url.clone()))
+                                    .child(
+                                        Clipboard::new("copy-connect-url")
+                                            .value(url)
+                                            .tooltip("Copy verification URL"),
+                                    ),
+                            )
+                            .child(
+                                Button::new("cancel-connect")
+                                    .label("Cancel authorization")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_connect(cx)
+                                    })),
+                            ),
+                    )
+                })
+                .when(self.connect_prompt.is_none() && !self.connect_linked, |settings| {
+                    settings.child(
+                        Button::new("enable-connect")
+                            .label("Enable T3 Connect")
+                            .primary()
+                            .disabled(!self.connect_available || self.environment_id.is_some())
+                            .on_click(cx.listener(|this, _, _, cx| this.start_connect(cx))),
+                    )
+                })
+                .when(self.connect_linked, |settings| {
+                    settings.child(
+                        Button::new("disable-connect")
+                            .label("Disable T3 Connect")
+                            .danger()
+                            .disabled(self.environment_id.is_some())
+                            .on_click(cx.listener(|this, _, _, cx| this.unlink_connect(cx))),
+                    )
+                })
+                .when(
+                    self.connect_identity.is_some()
+                        && !self.connect_linked
+                        && self.connect_prompt.is_none(),
+                    |settings| {
+                        settings.child(
+                            Button::new("sign-out-connect")
+                                .label("Sign out of T3 Connect")
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.forget_connect_account(cx)
+                                })),
+                        )
+                    },
+                )
                 .child("Agent for new threads")
                 .child(
                     div().flex().gap_2().children(
@@ -1249,6 +1432,7 @@ mod tests {
                             server,
                             runtime_for_window,
                             "127.0.0.1:3773".parse().unwrap(),
+                            None,
                             window,
                             cx,
                         )

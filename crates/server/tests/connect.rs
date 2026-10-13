@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde_json::{Value, json};
-use t3_connect::{DpopKey, EnvironmentIdentity};
+use t3_connect::{
+    AccountClient, AccountCredential, ConnectPublicConfig, DpopKey, EnvironmentIdentity,
+};
 use t3_server::{Server, ServerOptions};
 
 fn claims(token: &str) -> Result<Value> {
@@ -271,5 +273,97 @@ async fn relay_link_health_mint_and_dpop_work_over_the_existing_http_contract() 
     let reopened = Server::open(ServerOptions::new(directory.path()))?;
     assert_eq!(reopened.descriptor()["environmentId"], environment);
     reopened.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_link_sequence_configures_and_revokes_the_local_environment() -> Result<()> {
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct RelayState {
+        environment_id: String,
+        public_key: String,
+        linked: bool,
+        unlinked: bool,
+    }
+
+    async fn challenge(headers: HeaderMap) -> Json<Value> {
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer account-access"
+        );
+        Json(json!({"challenge":"relay-challenge","expiresAt":"2099-01-01T00:00:00Z"}))
+    }
+
+    async fn link(
+        State(state): State<Arc<Mutex<RelayState>>>,
+        Json(input): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(input["managedTunnelsEnabled"], false);
+        assert!(!input["proof"].as_str().unwrap_or_default().is_empty());
+        let mut state = state.lock().await;
+        state.linked = true;
+        Json(json!({
+            "ok":true,
+            "cloudUserId":"cloud-user",
+            "environmentId":state.environment_id,
+            "endpoint":{"providerKind":"manual","httpBaseUrl":"https://environment.fixture.test","wsBaseUrl":"wss://environment.fixture.test"},
+            "endpointRuntime":null,
+            "relayIssuer":"https://relay.fixture.test",
+            "environmentCredential":"environment-secret",
+            "cloudMintPublicKey":state.public_key
+        }))
+    }
+
+    async fn unlink(State(state): State<Arc<Mutex<RelayState>>>) -> Json<Value> {
+        state.lock().await.unlinked = true;
+        Json(json!({"ok":true}))
+    }
+
+    let directory = tempfile::tempdir()?;
+    let server = Server::open(ServerOptions::new(directory.path()))?;
+    let environment_id = server.descriptor()["environmentId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let relay_identity = EnvironmentIdentity::generate();
+    let state = Arc::new(Mutex::new(RelayState {
+        environment_id,
+        public_key: relay_identity.public_pem()?,
+        linked: false,
+        unlinked: false,
+    }));
+    let relay = Router::new()
+        .route("/v1/client/environment-link-challenges", post(challenge))
+        .route("/v1/client/environment-links", post(link).delete(unlink))
+        .route(
+            "/v1/client/environment-links/{id}",
+            post(link).delete(unlink),
+        )
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let relay_address = listener.local_addr()?;
+    let relay_task = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
+    let client = AccountClient::new(ConnectPublicConfig::for_test(&format!(
+        "http://{relay_address}"
+    ))?)?;
+    let credential = AccountCredential::for_test("account-access");
+
+    let link_state = server
+        .connect_link(&client, &credential, "127.0.0.1:3773".parse()?, false)
+        .await?;
+    assert_eq!(link_state["linked"], true);
+    assert_eq!(link_state["cloudUserId"], "cloud-user");
+    assert!(state.lock().await.linked);
+
+    let unlink_state = server.connect_unlink(Some((&client, &credential))).await?;
+    assert_eq!(unlink_state["endpointRuntimeStatus"]["status"], "disabled");
+    assert!(state.lock().await.unlinked);
+    assert_eq!(server.connect_state().await?["linked"], false);
+
+    relay_task.abort();
+    let _ = relay_task.await;
     Ok(())
 }

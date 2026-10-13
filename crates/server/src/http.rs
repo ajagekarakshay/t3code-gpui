@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
 };
 use t3_acp::{AgentCommand, Session as AgentSession, SessionCommand};
-use t3_connect::EnvironmentIdentity;
+use t3_connect::{AccountClient, AccountCredential, EnvironmentIdentity};
 use tokio::sync::{Mutex, broadcast};
 
 /// Server configuration belongs to its environment, including agent executables.
@@ -218,6 +218,26 @@ impl Server {
     }
     pub async fn start_connect(&self, address: std::net::SocketAddr) -> Result<()> {
         self.services.start_connect(address).await
+    }
+    pub async fn connect_link(
+        &self,
+        client: &AccountClient,
+        credential: &AccountCredential,
+        address: std::net::SocketAddr,
+        managed: bool,
+    ) -> Result<Value> {
+        self.services
+            .link_account(client, credential, address, managed)
+            .await
+    }
+    pub async fn connect_unlink(
+        &self,
+        client: Option<(&AccountClient, &AccountCredential)>,
+    ) -> Result<Value> {
+        self.services.unlink_account(client).await
+    }
+    pub async fn connect_state(&self) -> Result<Value> {
+        self.services.link_state().await
     }
     pub async fn shutdown(&self) {
         self.services.cloud.lock().await.stop().await;

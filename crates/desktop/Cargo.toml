@@ -10,10 +10,12 @@ anyhow.workspace = true
 async-channel.workspace = true
 axum.workspace = true
 clap.workspace = true
+dotenvy.workspace = true
 gpui-kit.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 t3-client = { path = "../client" }
+t3-connect = { path = "../connect" }
 t3-server = { path = "../server" }
 tokio.workspace = true
 uuid.workspace = true

@@ -1,6 +1,7 @@
 use clap::Parser;
 use gpui_kit::*;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use t3_connect::{AccountClient, ConnectPublicConfig};
 use t3_server::{Server, ServerOptions};
 
 mod backend;
@@ -16,6 +17,7 @@ struct Arguments {
 }
 
 fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::from_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env"));
     let arguments = Arguments::parse();
     let runtime = Arc::new(tokio::runtime::Runtime::new()?);
     let server = Server::open(ServerOptions::new(arguments.home_dir))?;
@@ -30,6 +32,9 @@ fn main() -> anyhow::Result<()> {
     });
     let shutdown = server.clone();
     let shutdown_runtime = runtime.clone();
+    let connect = ConnectPublicConfig::from_environment()?
+        .map(AccountClient::new)
+        .transpose()?;
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
         workspace::bind_keys(cx);
@@ -48,7 +53,14 @@ fn main() -> anyhow::Result<()> {
             cx,
             move |window, cx| {
                 cx.new(|cx| {
-                    workspace::Workspace::new(server.clone(), runtime.clone(), address, window, cx)
+                    workspace::Workspace::new(
+                        server.clone(),
+                        runtime.clone(),
+                        address,
+                        connect.clone(),
+                        window,
+                        cx,
+                    )
                 })
             },
         )

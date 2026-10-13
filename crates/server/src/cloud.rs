@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
-use t3_connect::{Tunnel, TunnelConfiguration};
+use t3_connect::{AccountClient, AccountCredential, Tunnel, TunnelConfiguration};
 
 #[derive(Debug)]
 pub(crate) enum ConnectError {
@@ -122,6 +122,90 @@ fn validate_endpoint(endpoint: &Value) -> Result<()> {
     Ok(())
 }
 impl Services {
+    pub(crate) async fn link_account(
+        self: &Arc<Self>,
+        client: &AccountClient,
+        credential: &AccountCredential,
+        address: SocketAddr,
+        managed: bool,
+    ) -> Result<Value> {
+        let environment_id = required(&self.descriptor, "environmentId")?;
+        let provider = if managed {
+            "cloudflare_tunnel"
+        } else {
+            "manual"
+        };
+        let origin_host = if address.ip().is_unspecified() {
+            "127.0.0.1".to_owned()
+        } else {
+            address.ip().to_string()
+        };
+        TunnelConfiguration::validate_origin(&origin_host, address.port())?;
+        let url_host = if origin_host.contains(':') {
+            format!("[{origin_host}]")
+        } else {
+            origin_host.clone()
+        };
+        let http_base_url = format!("http://{url_host}:{}", address.port());
+        let ws_base_url = format!("ws://{url_host}:{}", address.port());
+        let challenge = client.create_link_challenge(credential, managed).await?;
+        let relay_issuer = client.config().relay_issuer();
+        let proof_input = json!({
+            "challenge": challenge,
+            "relayIssuer": relay_issuer,
+            "endpoint": {
+                "httpBaseUrl": http_base_url,
+                "wsBaseUrl": ws_base_url,
+                "providerKind": provider
+            },
+            "origin": {"localHttpHost":origin_host,"localHttpPort":address.port()}
+        });
+        let proof = self.link_proof(
+            &proof_input,
+            &format!("{http_base_url}/api/connect/link-proof"),
+        )?;
+        let link = client.link_environment(credential, &proof, managed).await?;
+        if !link.ok
+            || link.environment_id != environment_id
+            || link.endpoint["providerKind"] != provider
+        {
+            let _ = client
+                .unlink_environment(credential, &link.environment_id)
+                .await;
+            ensure!(link.ok, "Relay did not confirm the environment link");
+            ensure!(
+                link.environment_id == environment_id,
+                "Relay linked a different environment"
+            );
+            anyhow::bail!("Relay returned a different endpoint provider");
+        }
+        let configuration = json!({
+            "relayUrl": client.config().relay_issuer(),
+            "relayIssuer": link.relay_issuer,
+            "cloudUserId": link.cloud_user_id,
+            "environmentCredential": link.environment_credential,
+            "cloudMintPublicKey": link.cloud_mint_public_key,
+            "endpointRuntime": link.endpoint_runtime
+        });
+        if let Err(error) = self.configure_relay(configuration).await {
+            let _ = client.unlink_environment(credential, environment_id).await;
+            return Err(error);
+        }
+        self.link_state().await
+    }
+
+    pub(crate) async fn unlink_account(
+        &self,
+        client: Option<(&AccountClient, &AccountCredential)>,
+    ) -> Result<Value> {
+        let environment_id = required(&self.descriptor, "environmentId")?;
+        let state = self.unlink().await?;
+        if let Some((client, credential)) = client {
+            let _ = client.unlink_environment(credential, environment_id).await;
+        }
+        Ok(state)
+    }
+
     fn relay_configuration(&self) -> Result<RelayConfiguration> {
         serde_json::from_str(
             &self

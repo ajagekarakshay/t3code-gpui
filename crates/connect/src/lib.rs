@@ -1,8 +1,12 @@
 //! T3 Connect's existing environment proof and DPoP wire formats.
 
+mod account;
 mod dpop;
 mod identity;
 mod tunnel;
+pub use account::{
+    AccountClient, AccountCredential, ConnectPublicConfig, DeviceAuthorization, RelayLinkResponse,
+};
 pub use dpop::{DpopKey, DpopProof, verify_dpop};
 pub use identity::{EnvironmentIdentity, validate_relay_key, verify_relay_proof};
 pub use tunnel::{Tunnel, TunnelConfiguration, TunnelState};
