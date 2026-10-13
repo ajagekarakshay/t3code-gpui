@@ -58,6 +58,8 @@ impl Store {
         };
         for (id, value) in interrupted {
             let mut thread: Value = serde_json::from_str(&value)?;
+            let interrupted_at = now();
+            let active_run_id = thread["activeRunId"].as_str().map(str::to_owned);
             thread["status"] = json!("error");
             thread["lastError"] =
                 json!("The server stopped during this turn. Send a new message to continue.");
@@ -65,7 +67,21 @@ impl Store {
             thread["pendingAcpPermission"] = Value::Null;
             thread["pendingRuntimeRequest"] = Value::Null;
             thread["authenticationMethods"] = Value::Null;
-            thread["updatedAt"] = json!(now());
+            thread["queueHeld"] = json!(true);
+            thread["latestRunCompletedAt"] = json!(interrupted_at);
+            if active_run_id
+                .as_deref()
+                .is_some_and(|run_id| thread["latestRunId"] == run_id)
+            {
+                thread["latestRunStatus"] = json!("failed");
+            }
+            thread["updatedAt"] = json!(interrupted_at);
+            if let Some(run_id) = active_run_id {
+                tx.execute(
+                    "UPDATE messages SET value=json_set(value,'$.runStatus','failed','$.runCompletedAt',?,'$.updatedAt',?) WHERE thread_id=? AND json_extract(value,'$.role')='user' AND json_extract(value,'$.runId')=?",
+                    params![interrupted_at, interrupted_at, id, run_id],
+                )?;
+            }
             write_record(&tx, "threads", &id, &thread)?;
             append_event(
                 &tx,
@@ -177,6 +193,8 @@ impl Store {
             .as_array()
             .context("Missing messages")?;
         let mut conversation = Vec::new();
+        let mut runs = Vec::new();
+        let mut run_ordinal = 0_u64;
         let mut turn_items = Vec::new();
         let mut visible = Vec::new();
         let mut runtime_requests = Vec::new();
@@ -184,7 +202,15 @@ impl Store {
             let Some(role) = message["role"].as_str() else {
                 continue;
             };
-            let status = if role == "tool" {
+            let status = if role == "user" {
+                match message["runStatus"].as_str() {
+                    Some("queued") => "pending",
+                    Some("cancelled") => "cancelled",
+                    Some("interrupted") => "interrupted",
+                    Some("failed") => "failed",
+                    _ => "completed",
+                }
+            } else if role == "tool" {
                 match message["toolCall"]["status"].as_str() {
                     Some("completed") => "completed",
                     Some("failed") => "failed",
@@ -222,6 +248,49 @@ impl Store {
                     base["attachments"] = message["attachments"].clone();
                     base["createdBy"] = message["createdBy"].clone();
                     base["creationSource"] = message["creationSource"].clone();
+                    run_ordinal += 1;
+                    let run_id = required(message, "runId")?;
+                    let active = thread["activeRunId"] == run_id;
+                    let run_status = if active {
+                        match thread["activityRunStatus"]
+                            .as_str()
+                            .or_else(|| thread["status"].as_str())
+                        {
+                            Some("starting") => "starting",
+                            Some("waiting") => "waiting",
+                            _ => "running",
+                        }
+                    } else {
+                        match message["runStatus"].as_str() {
+                            Some("queued") => "queued",
+                            Some("starting") => "starting",
+                            Some("interrupted") => "interrupted",
+                            Some("failed") => "failed",
+                            Some("cancelled") => "cancelled",
+                            _ => "completed",
+                        }
+                    };
+                    let mut run = json!({
+                        "id":run_id,
+                        "threadId":id,
+                        "ordinal":run_ordinal,
+                        "providerInstanceId":message.get("providerInstanceId").cloned().unwrap_or_else(||thread["providerInstanceId"].clone()),
+                        "modelSelection":message.get("modelSelection").cloned().unwrap_or_else(||thread["modelSelection"].clone()),
+                        "providerThreadId":null,
+                        "userMessageId":message["id"],
+                        "rootNodeId":null,
+                        "activeAttemptId":null,
+                        "status":run_status,
+                        "requestedAt":message["createdAt"],
+                        "startedAt":message.get("runStartedAt").cloned().unwrap_or_else(||message["createdAt"].clone()),
+                        "completedAt":if active {Value::Null} else {message.get("runCompletedAt").cloned().unwrap_or_else(|| message["updatedAt"].clone())},
+                        "checkpointId":null,
+                        "contextHandoffId":null
+                    });
+                    if run_status == "queued" {
+                        run["queueHeld"] = thread.get("queueHeld").cloned().unwrap_or(json!(false));
+                    }
+                    runs.push(run);
                 }
                 "assistant" => {
                     base["type"] = json!("assistant_message");
@@ -273,7 +342,10 @@ impl Store {
             let request_id = required(permission, "id")?;
             let request = &permission["request"];
             let request_kind = permission_request_kind(request);
-            let node_id = format!("node:{}", thread["latestRunId"].as_str().unwrap_or(id));
+            let permission_run_id = thread["activeRunId"]
+                .as_str()
+                .or_else(|| thread["latestRunId"].as_str());
+            let node_id = format!("node:{}", permission_run_id.unwrap_or(id));
             let provider_session_id = thread["nativeSessionId"]
                 .as_str()
                 .map(str::to_owned)
@@ -310,7 +382,7 @@ impl Store {
             let mut item = json!({
                 "id":format!("approval:{request_id}"),
                 "threadId":id,
-                "runId":thread["latestRunId"],
+                "runId":permission_run_id,
                 "nodeId":node_id,
                 "providerThreadId":null,
                 "providerTurnId":null,
@@ -341,7 +413,7 @@ impl Store {
         }
         let projection = json!({
             "thread":thread,
-            "runs":[],
+            "runs":runs,
             "attempts":[],
             "nodes":[],
             "subagents":[],
@@ -655,7 +727,7 @@ impl Store {
                     matches!(interaction_mode, "default" | "plan"),
                     "Unsupported interaction mode"
                 );
-                let thread = json!({"id":id,"projectId":project_id,"title":required(command,"title")?,"modelSelection":command["modelSelection"],"providerInstanceId":provider,"runtimeMode":command.get("runtimeMode").cloned().unwrap_or(json!("full-access")),"interactionMode":command.get("interactionMode").cloned().unwrap_or(json!("default")),"branch":command["branch"],"worktreePath":command["worktreePath"],"createdBy":command.get("createdBy").cloned().unwrap_or(json!("user")),"creationSource":command.get("creationSource").cloned().unwrap_or(json!("server")),"lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":id},"forkedFrom":null,"activeProviderThreadId":null,"latestRunId":null,"activeRunId":null,"status":"idle","pendingRuntimeRequest":null,"latestVisibleMessage":null,"latestUserMessageAt":null,"hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0,"createdAt":timestamp,"updatedAt":timestamp,"archivedAt":null,"settledOverride":null,"settledAt":null,"deletedAt":null});
+                let thread = json!({"id":id,"projectId":project_id,"title":required(command,"title")?,"modelSelection":command["modelSelection"],"providerInstanceId":provider,"runtimeMode":command.get("runtimeMode").cloned().unwrap_or(json!("full-access")),"interactionMode":command.get("interactionMode").cloned().unwrap_or(json!("default")),"branch":command["branch"],"worktreePath":command["worktreePath"],"createdBy":command.get("createdBy").cloned().unwrap_or(json!("user")),"creationSource":command.get("creationSource").cloned().unwrap_or(json!("server")),"lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":id},"forkedFrom":null,"activeProviderThreadId":null,"latestRunId":null,"latestRunStatus":null,"activeRunId":null,"status":"idle","pendingRuntimeRequest":null,"latestVisibleMessage":null,"latestUserMessageAt":null,"hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0,"createdAt":timestamp,"updatedAt":timestamp,"archivedAt":null,"settledOverride":null,"settledAt":null,"deletedAt":null});
                 write_record(&tx, "threads", id, &thread)?;
                 json!({"type":"thread.updated","thread":thread})
             }
@@ -666,12 +738,16 @@ impl Store {
                     thread["deletedAt"].is_null() && thread["archivedAt"].is_null(),
                     "Thread is unavailable"
                 );
+                let active = !thread["activeRunId"].is_null();
+                let dispatch_mode = command["dispatchMode"]["type"]
+                    .as_str()
+                    .unwrap_or("start_immediately");
+                let queued = active
+                    && (dispatch_mode == "queue_after_active"
+                        || command["deliveryIntent"] == "auto");
                 ensure!(
-                    !matches!(
-                        thread["status"].as_str(),
-                        Some("starting" | "running" | "waiting")
-                    ),
-                    "A turn is already running"
+                    !active || queued,
+                    "Use queue-after-active while this ACP turn is running"
                 );
                 ensure!(
                     command
@@ -683,7 +759,7 @@ impl Store {
                 let text = required(command, "text")?;
                 let message_id = required(command, "messageId")?;
                 let run_id = uuid::Uuid::new_v4().to_string();
-                let message = json!({"id":message_id,"threadId":id,"runId":run_id,"nodeId":null,"role":"user","text":text,"attachments":[],"streaming":false,"createdAt":timestamp,"updatedAt":timestamp,"createdBy":thread["createdBy"],"creationSource":thread["creationSource"]});
+                let message = json!({"id":message_id,"threadId":id,"runId":run_id,"nodeId":null,"role":"user","text":text,"attachments":[],"streaming":false,"runStatus":if queued {"queued"} else {"starting"},"runStartedAt":if queued {Value::Null} else {json!(timestamp)},"runCompletedAt":null,"providerInstanceId":thread["providerInstanceId"],"modelSelection":thread["modelSelection"],"createdAt":timestamp,"updatedAt":timestamp,"createdBy":command.get("createdBy").cloned().unwrap_or_else(||thread["createdBy"].clone()),"creationSource":command.get("creationSource").cloned().unwrap_or_else(||thread["creationSource"].clone())});
                 ensure!(
                     !exists(&tx, "messages", message_id)?,
                     "Message ID already exists"
@@ -692,9 +768,21 @@ impl Store {
                     "INSERT INTO messages(id,thread_id,value) VALUES (?,?,?)",
                     params![message_id, id, message.to_string()],
                 )?;
-                thread["activeRunId"] = json!(run_id);
                 thread["latestRunId"] = json!(run_id);
-                thread["status"] = json!("starting");
+                thread["latestRunStatus"] = json!(if queued { "queued" } else { "starting" });
+                thread["latestRunRequestedAt"] = json!(timestamp);
+                thread["latestRunStartedAt"] = if queued {
+                    Value::Null
+                } else {
+                    json!(timestamp)
+                };
+                thread["latestRunCompletedAt"] = Value::Null;
+                if !queued {
+                    thread["activeRunId"] = json!(run_id);
+                    thread["status"] = json!("starting");
+                    thread["activityRunStartedAt"] = json!(timestamp);
+                    thread["activityRunStatus"] = json!("starting");
+                }
                 thread["lastError"] = Value::Null;
                 thread["updatedAt"] = json!(timestamp);
                 thread["latestUserMessageAt"] = json!(timestamp);
@@ -705,8 +793,12 @@ impl Store {
                     json!(thread["visibleItemCount"].as_u64().unwrap_or(0) + 1);
                 write_record(&tx, "threads", id, &thread)?;
                 tx.execute(
-                    "INSERT INTO outbox(thread_id,value) VALUES (?,?)",
-                    params![id, command.to_string()],
+                    "INSERT INTO outbox(thread_id,value,status) VALUES (?,?,?)",
+                    params![
+                        id,
+                        command.to_string(),
+                        if queued { "held" } else { "pending" }
+                    ],
                 )?;
                 json!({"type":"rust.message.dispatched","message":message,"thread":thread})
             }
@@ -750,7 +842,7 @@ impl Store {
             }
             "run.interrupt" => {
                 let id = required(command, "threadId")?;
-                let thread = read_record(&tx, "threads", id)?;
+                let mut thread = read_record(&tx, "threads", id)?;
                 ensure!(
                     thread["activeRunId"] == required(command, "runId")?,
                     "Run is no longer active"
@@ -766,7 +858,80 @@ impl Store {
                     "INSERT INTO outbox(thread_id,value) VALUES (?,?)",
                     params![id, command.to_string()],
                 )?;
+                if command["holdQueue"] == true {
+                    thread["queueHeld"] = json!(true);
+                    thread["updatedAt"] = json!(timestamp);
+                    write_record(&tx, "threads", id, &thread)?;
+                }
                 json!({"type":"rust.run.interrupt-requested","threadId":id,"runId":thread["activeRunId"],"reason":command["reason"]})
+            }
+            "queue.resume" => {
+                let id = required(command, "threadId")?;
+                let mut thread = read_record(&tx, "threads", id)?;
+                thread["queueHeld"] = json!(false);
+                promote_next_queued(&tx, id, &mut thread, &timestamp)?;
+                thread["updatedAt"] = json!(timestamp);
+                write_record(&tx, "threads", id, &thread)?;
+                json!({"type":"thread.updated","thread":thread})
+            }
+            "queued-run.cancel" | "queued-run.edit" => {
+                let id = required(command, "threadId")?;
+                let run_id = required(command, "runId")?;
+                let message_json: String = tx
+                    .query_row(
+                        "SELECT value FROM messages WHERE thread_id=? AND json_extract(value,'$.role')='user' AND json_extract(value,'$.runId')=?",
+                        params![id, run_id],
+                        |row| row.get(0),
+                    )
+                    .context("Queued run is unavailable")?;
+                let mut message: Value = serde_json::from_str(&message_json)?;
+                ensure!(message["runStatus"] == "queued", "Run is no longer queued");
+                let message_id = required(&message, "id")?.to_owned();
+                let effect: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT id,value FROM outbox WHERE thread_id=? AND status='held' AND json_extract(value,'$.messageId')=?",
+                        params![id, message_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let (effect_id, effect_json) = effect.context("Queued effect is unavailable")?;
+                let mut thread = read_record(&tx, "threads", id)?;
+                if kind == "queued-run.cancel" {
+                    message["runStatus"] = json!("cancelled");
+                    message["runCompletedAt"] = json!(timestamp);
+                    tx.execute("UPDATE outbox SET status='retired' WHERE id=?", [effect_id])?;
+                } else {
+                    ensure!(
+                        command
+                            .get("attachments")
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty),
+                        "Attachments are not ported yet"
+                    );
+                    let text = required(command, "text")?;
+                    message["text"] = json!(text);
+                    let mut effect: Value = serde_json::from_str(&effect_json)?;
+                    effect["text"] = json!(text);
+                    tx.execute(
+                        "UPDATE outbox SET value=? WHERE id=?",
+                        params![effect.to_string(), effect_id],
+                    )?;
+                    if thread["latestVisibleMessage"]["id"] == message_id {
+                        thread["latestVisibleMessage"]["text"] = json!(text);
+                    }
+                }
+                message["updatedAt"] = json!(timestamp);
+                tx.execute(
+                    "UPDATE messages SET value=? WHERE id=?",
+                    params![message.to_string(), message_id],
+                )?;
+                if thread["latestRunId"] == run_id && kind == "queued-run.cancel" {
+                    thread["latestRunCompletedAt"] = json!(timestamp);
+                    thread["latestRunStatus"] = json!("cancelled");
+                }
+                thread["updatedAt"] = json!(timestamp);
+                write_record(&tx, "threads", id, &thread)?;
+                json!({"type":"thread.updated","thread":thread})
             }
             "thread.archive"
             | "thread.unarchive"
@@ -907,9 +1072,11 @@ impl Store {
         let tx = connection.transaction()?;
         let mut thread = read_record(&tx, "threads", thread_id)?;
         let timestamp = now();
+        let active_run_id = thread["activeRunId"].as_str().map(str::to_owned);
         let mut inserted_item = false;
         if let Some(text) = text {
-            let message_id = format!("assistant:{}", required(&thread, "latestRunId")?);
+            let active_run_id = active_run_id.as_deref().context("No active run")?;
+            let message_id = format!("assistant:{active_run_id}");
             let existing: Option<String> = tx
                 .query_row(
                     "SELECT value FROM messages WHERE id=?",
@@ -921,7 +1088,7 @@ impl Store {
             let mut message = if let Some(value) = existing {
                 serde_json::from_str::<Value>(&value)?
             } else {
-                json!({"id":message_id,"threadId":thread_id,"runId":thread["latestRunId"],"nodeId":null,"role":"assistant","text":"","attachments":[],"streaming":true,"createdAt":timestamp,"updatedAt":timestamp,"createdBy":"agent","creationSource":"provider"})
+                json!({"id":message_id,"threadId":thread_id,"runId":active_run_id,"nodeId":null,"role":"assistant","text":"","attachments":[],"streaming":true,"createdAt":timestamp,"updatedAt":timestamp,"createdBy":"agent","creationSource":"provider"})
             };
             message["text"] = json!(format!(
                 "{}{text}",
@@ -936,8 +1103,9 @@ impl Store {
             update["sessionUpdate"].as_str(),
             Some("tool_call" | "tool_call_update")
         ) {
+            let active_run_id = active_run_id.as_deref().context("No active run")?;
             let tool_id = required(update, "toolCallId")?;
-            let message_id = format!("tool:{}:{tool_id}", required(&thread, "latestRunId")?);
+            let message_id = format!("tool:{active_run_id}:{tool_id}");
             let existing: Option<String> = tx
                 .query_row(
                     "SELECT value FROM messages WHERE id=?",
@@ -946,7 +1114,7 @@ impl Store {
                 )
                 .optional()?;
             inserted_item |= existing.is_none();
-            let mut message = existing.map(|value|serde_json::from_str::<Value>(&value)).transpose()?.unwrap_or(json!({"id":message_id,"threadId":thread_id,"runId":thread["latestRunId"],"role":"tool","text":"","toolCall":{},"createdAt":timestamp,"updatedAt":timestamp}));
+            let mut message = existing.map(|value|serde_json::from_str::<Value>(&value)).transpose()?.unwrap_or(json!({"id":message_id,"threadId":thread_id,"runId":active_run_id,"role":"tool","text":"","toolCall":{},"createdAt":timestamp,"updatedAt":timestamp}));
             if let Some(fields) = update.as_object() {
                 for (key, value) in fields {
                     if key != "sessionUpdate" {
@@ -975,6 +1143,31 @@ impl Store {
         if finished || failure.is_some() {
             thread["activeRunId"] = Value::Null;
             tx.execute("UPDATE messages SET value=json_set(value,'$.streaming',json('false')) WHERE thread_id=?",[thread_id])?;
+        }
+        let run_status = if failure.is_some() {
+            "failed"
+        } else if finished && event["data"]["stopReason"] == "cancelled" {
+            "interrupted"
+        } else if finished {
+            "completed"
+        } else if event["type"] == "acp.permission"
+            || event["type"] == "acp.authentication.required"
+        {
+            "waiting"
+        } else {
+            "running"
+        };
+        if let Some(active_run_id) = active_run_id.as_deref() {
+            tx.execute(
+                "UPDATE messages SET value=json_set(value,'$.runStatus',?,'$.runCompletedAt',?,'$.updatedAt',?) WHERE thread_id=? AND json_extract(value,'$.role')='user' AND json_extract(value,'$.runId')=?",
+                params![run_status, if finished || failure.is_some() { Some(timestamp.as_str()) } else { None }, timestamp, thread_id, active_run_id],
+            )?;
+            if (finished || failure.is_some()) && thread["latestRunId"] == active_run_id {
+                thread["latestRunCompletedAt"] = json!(timestamp);
+            }
+            if thread["latestRunId"] == active_run_id {
+                thread["latestRunStatus"] = json!(run_status);
+            }
         }
         if let Some(failure) = failure {
             thread["lastError"] = json!(failure);
@@ -1016,6 +1209,13 @@ impl Store {
             thread["visibleItemCount"] =
                 json!(thread["visibleItemCount"].as_u64().unwrap_or(0) + 1);
         }
+        if finished || failure.is_some() {
+            thread["activityRunStartedAt"] = Value::Null;
+            thread["activityRunStatus"] = Value::Null;
+            promote_next_queued(&tx, thread_id, &mut thread, &timestamp)?;
+        } else {
+            thread["activityRunStatus"] = thread["status"].clone();
+        }
         thread["updatedAt"] = json!(timestamp);
         write_record(&tx, "threads", thread_id, &thread)?;
         let mut change =
@@ -1028,7 +1228,9 @@ impl Store {
 }
 
 fn normalize_thread_status(thread: &mut Value) {
-    if thread["status"] == "error" {
+    if let Some(status) = thread["latestRunStatus"].as_str() {
+        thread["status"] = json!(if status == "error" { "failed" } else { status });
+    } else if thread["status"] == "error" {
         thread["status"] = json!("failed");
     }
     if let Some(permission) = thread
@@ -1132,6 +1334,48 @@ fn read_record(connection: &Connection, table: &str, id: &str) -> Result<Value> 
         .with_context(|| format!("Unknown {table} ID"))?;
     Ok(serde_json::from_str(&value)?)
 }
+
+fn promote_next_queued(
+    tx: &Transaction<'_>,
+    thread_id: &str,
+    thread: &mut Value,
+    timestamp: &str,
+) -> Result<bool> {
+    if !thread["activeRunId"].is_null() || thread["queueHeld"] == true {
+        return Ok(false);
+    }
+    let queued: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id,value FROM outbox WHERE thread_id=? AND status='held' ORDER BY id LIMIT 1",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((effect_id, command_json)) = queued else {
+        return Ok(false);
+    };
+    let command: Value = serde_json::from_str(&command_json)?;
+    let message_id = required(&command, "messageId")?;
+    let mut message = read_record(tx, "messages", message_id)?;
+    let run_id = required(&message, "runId")?.to_owned();
+    message["runStatus"] = json!("starting");
+    message["runStartedAt"] = json!(timestamp);
+    message["updatedAt"] = json!(timestamp);
+    tx.execute(
+        "UPDATE messages SET value=? WHERE id=?",
+        params![message.to_string(), message_id],
+    )?;
+    tx.execute("UPDATE outbox SET status='pending' WHERE id=?", [effect_id])?;
+    thread["activeRunId"] = json!(run_id);
+    thread["status"] = json!("starting");
+    thread["activityRunStartedAt"] = json!(timestamp);
+    thread["activityRunStatus"] = json!("starting");
+    if thread["latestRunId"] == run_id {
+        thread["latestRunStartedAt"] = json!(timestamp);
+        thread["latestRunStatus"] = json!("starting");
+    }
+    Ok(true)
+}
 fn write_record(tx: &Transaction<'_>, table: &str, id: &str, value: &Value) -> Result<()> {
     tx.execute(&format!("INSERT INTO {table}(id,value) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value"),params![id,value.to_string()])?;
     Ok(())
@@ -1221,6 +1465,10 @@ mod tests {
         assert_eq!(reopened.thread("thread")?["thread"]["status"], "error");
         assert_eq!(
             reopened.compatible_shell()?["threads"][0]["status"],
+            "failed"
+        );
+        assert_eq!(
+            reopened.compatible_thread("thread")?["projection"]["runs"][0]["status"],
             "failed"
         );
         assert!(reopened.claim_effect()?.is_none());
@@ -1317,6 +1565,46 @@ mod tests {
     }
 
     #[test]
+    fn queued_runs_can_be_edited_and_cancelled_without_reaching_the_agent() -> Result<()> {
+        let (_directory, store) = setup()?;
+        store.dispatch(&message())?;
+        store.dispatch(&json!({
+            "type":"message.dispatch",
+            "commandId":"queue",
+            "threadId":"thread",
+            "messageId":"queued-message",
+            "text":"queued",
+            "attachments":[],
+            "deliveryIntent":"auto",
+            "dispatchMode":{"type":"start_immediately"}
+        }))?;
+        let projection = store.compatible_thread("thread")?;
+        let queued_run = projection["projection"]["runs"][1]["id"]
+            .as_str()
+            .context("Queued run")?
+            .to_owned();
+        assert_eq!(projection["projection"]["runs"][0]["status"], "starting");
+        assert_eq!(projection["projection"]["runs"][1]["status"], "queued");
+        assert_eq!(
+            projection["projection"]["turnItems"][1]["status"],
+            "pending"
+        );
+        store.dispatch(&json!({"type":"queued-run.edit","commandId":"edit","threadId":"thread","runId":queued_run,"text":"revised"}))?;
+        assert_eq!(
+            store.compatible_thread("thread")?["projection"]["messages"][1]["text"],
+            "revised"
+        );
+        store.dispatch(&json!({"type":"queued-run.cancel","commandId":"cancel","threadId":"thread","runId":queued_run}))?;
+        let projection = store.compatible_thread("thread")?;
+        assert_eq!(projection["projection"]["runs"][1]["status"], "cancelled");
+        assert_eq!(
+            projection["projection"]["turnItems"][1]["status"],
+            "cancelled"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn native_tool_updates_and_pending_permissions_survive_snapshot_reads() -> Result<()> {
         let (_directory, store) = setup()?;
         store.dispatch(&message())?;
@@ -1336,6 +1624,10 @@ mod tests {
         assert_eq!(
             compatible_waiting["projection"]["runtimeRequests"][0]["responseCapability"]["type"],
             "live"
+        );
+        assert_eq!(
+            compatible_waiting["projection"]["runs"][0]["status"],
+            "waiting"
         );
         assert_eq!(
             compatible_waiting["projection"]["turnItems"][2]["type"],
@@ -1391,6 +1683,7 @@ mod tests {
             compatible["projection"]["visibleTurnItems"][1]["item"]["output"],
             "saved"
         );
+        assert_eq!(compatible["projection"]["runs"][0]["status"], "completed");
         Ok(())
     }
 }

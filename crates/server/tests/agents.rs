@@ -59,6 +59,15 @@ async fn durable_dispatch_runs_acp_permissions_cancellation_and_native_resume() 
     assert!(snapshot["thread"]["pendingAcpPermission"].is_null());
     server.dispatch(json!({"type":"message.dispatch","commandId":"wait","threadId":"thread","messageId":"wait","text":"wait","attachments":[]})).await?;
     milestone(&mut events, "acp.update").await?;
+    server.dispatch(json!({"type":"message.dispatch","commandId":"queued","threadId":"thread","messageId":"queued","text":"queued","attachments":[],"deliveryIntent":"auto","dispatchMode":{"type":"start_immediately"}})).await?;
+    assert_eq!(
+        server.thread("thread")?["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["runStatus"],
+        "queued"
+    );
     let run_id = server.thread("thread")?["thread"]["activeRunId"]
         .as_str()
         .context("Active run ID")?
@@ -68,6 +77,23 @@ async fn durable_dispatch_runs_acp_permissions_cancellation_and_native_resume() 
     assert_eq!(server.dispatch(interrupt).await?, interrupt_result);
     let cancelled = milestone(&mut events, "acp.turn.finished").await?;
     assert_eq!(cancelled["agentEvent"]["data"]["stopReason"], "cancelled");
+    assert_eq!(
+        server.thread("thread")?["messages"][4]["runStatus"],
+        "interrupted"
+    );
+    assert!(server.thread("thread")?["thread"]["activeRunId"].is_null());
+    server
+        .dispatch(json!({"type":"queue.resume","commandId":"resume-queue","threadId":"thread"}))
+        .await?;
+    milestone(&mut events, "acp.turn.finished").await?;
+    assert_eq!(
+        server.thread("thread")?["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["text"],
+        "queued second chunk"
+    );
     server.shutdown().await;
     drop(server);
     let reopened = Server::open(options(directory.path()))?;

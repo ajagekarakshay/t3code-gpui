@@ -1,7 +1,7 @@
 use crate::{activity::ActivityKind, http::Services, store::required};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 use t3_acp::{AgentEvent, Session, SessionCommand};
 
 impl Services {
@@ -38,17 +38,7 @@ impl Services {
                 self.queue_activity(thread_id, activity).await;
             }
         }
-        let services = self.clone();
-        let task = tokio::spawn(async move {
-            if let Err(error) = services.execute_pending().await {
-                tracing::error!(%error,"Effect worker failed");
-            }
-        });
-        {
-            let mut tasks = self.tasks.lock().await;
-            tasks.retain(|task| !task.is_finished());
-            tasks.push(task);
-        }
+        self.schedule_effects().await;
         Ok(result)
     }
 
@@ -153,6 +143,24 @@ impl Services {
             self.store.complete_effect(id)?;
         }
         Ok(())
+    }
+
+    async fn schedule_effects(self: &Arc<Self>) {
+        let effect = self.clone().execute_pending_boxed();
+        let task = tokio::spawn(async move {
+            if let Err(error) = effect.await {
+                tracing::error!(%error, "Effect worker failed");
+            }
+        });
+        let mut tasks = self.tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    fn execute_pending_boxed(
+        self: Arc<Self>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+        Box::pin(async move { self.execute_pending().await })
     }
 
     async fn deliver_permission_response(
@@ -302,9 +310,14 @@ impl Services {
             finished,
             failure.as_deref(),
         )?;
+        let continued = finished || failure.is_some();
+        let queued_run_started = continued && change["thread"]["activeRunId"].is_string();
         let _ = self.changes.send(change);
         let event_type = event["type"].as_str();
-        if finished || failure.is_some() {
+        if queued_run_started {
+            self.queue_activity(thread_id, ActivityKind::Normal).await;
+            self.schedule_effects().await;
+        } else if continued {
             self.queue_activity(thread_id, ActivityKind::Terminal).await;
         } else if matches!(
             event_type,

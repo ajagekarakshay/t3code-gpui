@@ -98,7 +98,7 @@ impl Server {
             _ => "other",
         };
         // Do not advertise full V2 parity while the Rust projections are being ported.
-        let descriptor = json!({"environmentId":id,"label":options.label,"platform":{"os":os,"arch":arch},"serverVersion":env!("CARGO_PKG_VERSION"),"orchestrationProtocolVersion":2,"capabilities":{"repositoryIdentity":false},"rustMigration":true});
+        let descriptor = json!({"environmentId":id,"label":options.label,"platform":{"os":os,"arch":arch},"serverVersion":env!("CARGO_PKG_VERSION"),"orchestrationProtocolVersion":2,"capabilities":{"repositoryIdentity":false,"serverResolvedCommandContext":true},"rustMigration":true});
         let (changes, _) = broadcast::channel(256);
         Ok(Self {
             services: Arc::new(Services {
