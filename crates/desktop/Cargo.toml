@@ -17,3 +17,7 @@ t3-server = { path = "../server" }
 tokio.workspace = true
 uuid.workspace = true
 
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

@@ -100,6 +100,16 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn set_metadata_batch(&self, values: &[(&str, String)]) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        for (key, value) in values {
+            tx.execute("INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn remove_metadata(&self, keys: &[&str]) -> Result<()> {
         let mut connection = self.lock()?;
         let tx = connection.transaction()?;

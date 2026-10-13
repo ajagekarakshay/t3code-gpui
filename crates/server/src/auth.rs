@@ -282,13 +282,29 @@ impl Store {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ProofReplayed;
+impl std::fmt::Display for ProofReplayed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Proof replayed")
+    }
+}
+impl std::error::Error for ProofReplayed {}
+
 fn consume_replay(tx: &rusqlite::Transaction<'_>, key: &str, expires: i64) -> Result<()> {
     tx.execute("DELETE FROM replay_guards WHERE expires<=?", [epoch()])?;
-    tx.execute(
+    match tx.execute(
         "INSERT INTO replay_guards(key,expires) VALUES (?,?)",
         params![key, expires],
-    )
-    .context("Proof replayed")?;
+    ) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            return Err(ProofReplayed.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 

@@ -1,141 +1,41 @@
-# T3 Code
+# T3 Code Native
 
-T3 Code is an "agent harness control surface". It enables control of the agents on your machine with a best-in-class mobile app ([iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824), [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), [web app](https://app.t3.codes) and [Electron-based desktop app](https://t3.codes).
+A Rust desktop and environment-server rewrite of T3 Code, using [GPUI Kit](https://gpui-kit.com) and [Agent Client Protocol](https://agentclientprotocol.com). Claude Code and Codex share one ACP integration.
 
-Works with your subscriptions on Claude Code, Codex, Cursor, Grok Build, OpenCode, and Google Antigravity. If they're set up on your computer, T3 Code can control them.
+**The migration is in progress. This is not yet a feature-complete replacement for the Electron application.** The native path currently uses its own database and does not advertise full orchestration V2 compatibility to existing clients. The original implementation remains available for completing and checking parity, including T3 Connect and mobile compatibility. iOS and Android source is unchanged.
 
-## "Wait, what are you selling me?"
+## Run the native desktop
 
-Nothing. We built T3 Code because we wanted the best possible development experience with agents. We were inspired by existing solutions like the Codex desktop app, Conductor, Claude Desktop and Cursor Glass, but none met our bar.
+Use Rust 1.96 and your platform's GPUI build dependencies. On macOS, install Xcode and its command line tools. The [native CI workflow](.github/workflows/native.yml) lists the Linux build packages.
 
-We wanted something performant, remote-ready, and truly open. If we ever go the wrong direction, we want you to have everything you need to fork and build the editor that you want.
+Install and authenticate Claude Code or Codex, then install their maintained ACP adapters:
 
-## Installation
-
-> [!WARNING]
-> T3 Code currently supports Codex, Claude, Cursor, Grok Build, OpenCode, and Antigravity. Install and authenticate at least one provider before use:
->
-> - Codex: install [Codex CLI](https://developers.openai.com/codex/cli) and run `codex login`
-> - Claude: install [Claude Code](https://claude.com/product/claude-code) and run `claude auth login`
-> - Cursor: install [Cursor CLI](https://cursor.com/cli) and run `agent login`
-> - Grok Build: install [Grok Build CLI](https://x.ai/cli) and run `grok login`
-> - OpenCode: install [OpenCode](https://opencode.ai) and run `opencode auth login`
-> - Antigravity: enable it in Settings, then use **Install Antigravity** and **Sign in with Google**. No CLI is required.
-
-### Command line
-
-```bash
-curl -fsSL https://t3.codes/install.sh | sh
+```sh
+npm install --global @agentclientprotocol/claude-agent-acp @agentclientprotocol/codex-acp
+cargo run -p t3-desktop -- --home-dir .t3/rust
 ```
 
-On Windows, in PowerShell:
+The adapters must be available as `claude-agent-acp` and `codex-acp` on `PATH`. The desktop and server are Rust; the separately maintained adapters have their own runtime dependencies. ACP provides a common protocol while each agent retains its own capabilities and behavior.
 
-```powershell
-irm https://t3.codes/install.ps1 | iex
+Add a project directory, create a thread, and send a prompt. The desktop runs its Rust environment server on an available loopback port. Agent configuration comes from the active ACP session. Command/Control-K opens the command palette; Command/Control-Enter sends a prompt.
+
+The standalone development server is also available:
+
+```sh
+cargo run -p t3-server -- --home-dir .t3/rust --listen 127.0.0.1:3773
 ```
 
-Then run `t3` to start the server and open the local web app. `t3 service install` keeps it running in the background, `t3 update` moves to a newer release, and `t3 --help` has the full reference.
+Use a different data directory when running it alongside the desktop. Each Rust data directory has one server owner. The migration rejects the live `~/.t3` tree, and does not import or modify the existing installation's database.
 
-To try it once without installing, run `npx t3@latest` instead.
+## Verify the native code
 
-### Desktop app
-
-Install the latest version of the desktop app from [GitHub Releases](https://github.com/pingdotgg/t3code/releases), or from your favorite package registry:
-
-#### Windows (`winget`)
-
-```bash
-winget install T3Tools.T3Code
+```sh
+cargo test -p t3-acp -p t3-connect -p t3-server --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked
+cargo test -p t3-desktop --locked
+cargo clippy -p t3-acp -p t3-connect -p t3-server -p t3-desktop --all-targets --features t3-acp/test-support,t3-connect/test-support,t3-server/test-support --locked -- -D warnings
+cargo build -p t3-desktop -p t3-server --locked
 ```
 
-#### Windows (`scoop`)
+ACP and tunnel tests run deterministic subprocess peers. Connect tests use synthetic signing keys and isolated local servers. Desktop interaction tests run GPUI Kit components in headless windows. These checks do not establish live relay, real-agent, or packaged-application parity.
 
-```bash
-scoop install extras/t3code
-```
-
-#### macOS (Homebrew)
-
-```bash
-brew install --cask t3-code
-```
-
-#### Debian, Ubuntu (`.deb`)
-
-Download the `.deb` from [GitHub Releases](https://github.com/pingdotgg/t3code/releases), then:
-
-```bash
-sudo apt install ./T3-Code-*.deb
-```
-
-#### Arch Linux (AUR)
-
-Stable:
-
-```bash
-yay -S t3code-bin
-```
-
-Nightly:
-
-```bash
-yay -S t3code-nightly-bin
-```
-
-The AUR packaging is maintained in this repository under [`packaging/aur`](./packaging/aur).
-
-## Some notes
-
-We are very very early in this project. Expect bugs.
-
-We are (mostly) not accepting contributions yet. Small fixes may be considered. Big features will not be.
-
-## Documentation
-
-Full docs live in [docs/](./docs). There's no docs site yet.
-
-- [Install and first run](./docs/user/install.md)
-- [Permission modes](./docs/user/permission-modes.md)
-- [Keyboard shortcuts](./docs/user/keybindings.md)
-- [Project settings](./docs/user/project-settings.md)
-- [Appearance preferences](./docs/user/appearance.md)
-- [Remote access from a phone or another machine](./docs/user/remote-access.md)
-- [Connect Claude Code, Codex, ChatGPT and other agents over MCP](./docs/user/outside-agents.md)
-- [Keeping app and server in sync](./docs/user/updating.md)
-- [Source control integrations](./docs/user/source-control.md)
-- Multiple accounts: [Codex](./docs/user/providers-codex.md) · [Claude](./docs/user/providers-claude.md)
-- [Run T3 Code as a background service](./docs/user/background-service.md)
-
-Building from source? Start at [docs/internals/overview.md](./docs/internals/overview.md).
-
-## If you REALLY want to contribute still.... read this first
-
-### Install `vp`
-
-T3 Code uses Vite+ so you'll need to install the global `vp` command-line tool.
-
-#### macOS / Linux
-
-```bash
-curl -fsSL https://vite.plus | bash
-```
-
-#### Windows
-
-```bash
-irm https://vite.plus/ps1 | iex
-```
-
-Checkout their getting started guide for more information: https://viteplus.dev/guide/
-
-### Install dependencies
-
-```bash
-vp i
-```
-
-Read [CONTRIBUTING.md](./CONTRIBUTING.md) before reporting a bug or opening a PR.
-
-Have a feature request? Start an [Ideas discussion](https://github.com/pingdotgg/t3code/discussions/categories/ideas).
-
-Need support? Join the [Discord](https://discord.gg/jn4EGJjrvv).
+Vendored references are preserved under `backup/references`. The [upstream README](backup/README-upstream.md) describes the original application and its installation procedures.

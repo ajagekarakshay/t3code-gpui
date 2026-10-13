@@ -146,6 +146,7 @@ async fn relay_link_health_mint_and_dpop_work_over_the_existing_http_contract() 
         json!({"proof":relay.sign(t3_connect::HEALTH_REQUEST_TYPE,&health_claims)?});
     let health: Value = client
         .post(format!("{base}/api/t3-connect/health"))
+        .header("x-forwarded-proto", "https")
         .json(&health_request)
         .send()
         .await?
@@ -169,7 +170,7 @@ async fn relay_link_health_mint_and_dpop_work_over_the_existing_http_contract() 
             .send()
             .await?
             .status(),
-        400
+        409
     );
     let key = DpopKey::generate();
     let thumbprint = key.thumbprint()?;
@@ -177,6 +178,7 @@ async fn relay_link_health_mint_and_dpop_work_over_the_existing_http_contract() 
     let mint_request = json!({"proof":relay.sign(t3_connect::MINT_REQUEST_TYPE,&mint_claims)?});
     let minted: Value = client
         .post(format!("{base}/api/connect/mint-credential"))
+        .header("x-forwarded-proto", "https")
         .json(&mint_request)
         .send()
         .await?
@@ -201,7 +203,7 @@ async fn relay_link_health_mint_and_dpop_work_over_the_existing_http_contract() 
             .send()
             .await?
             .status(),
-        400
+        409
     );
     let credential = minted["credential"].as_str().unwrap();
     assert_eq!(

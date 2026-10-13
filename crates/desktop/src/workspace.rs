@@ -149,13 +149,15 @@ impl Workspace {
                 }
             }
         });
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
         Self {
             requests,
             _backend: backend,
             _runtime: runtime,
             _updates: task,
             _subscriptions: subscriptions,
-            focus: cx.focus_handle(),
+            focus,
             composer,
             path,
             palette,
@@ -267,6 +269,9 @@ impl Workspace {
                 let old_count = self.messages.len();
                 let count = messages.len();
                 self.messages = Rc::new(messages);
+                self.error = snapshot["thread"]["lastError"]
+                    .as_str()
+                    .map(|message| SharedString::from(message.to_owned()));
                 self.detail = snapshot;
                 self.refresh_agent_controls(window, cx);
                 self.scroller.update(cx, |state, cx| {
@@ -332,6 +337,11 @@ impl Workspace {
         self.detail["thread"] = change["thread"].clone();
         self.detail["snapshotSequence"] = change["sequence"].clone();
         let event = &change["agentEvent"];
+        if event["type"] == "acp.failure" {
+            self.error = event["message"]
+                .as_str()
+                .map(|message| SharedString::from(message.to_owned()));
+        }
         if event["type"] == "acp.permission" {
             self.permissions.insert(thread_id.to_owned(), event.clone());
         }
@@ -602,6 +612,9 @@ impl Workspace {
                     }),
             )
         });
+        cx.defer_in(window, |this, window, cx| {
+            this.palette.update(cx, |state, cx| state.focus(window, cx))
+        });
     }
 
     fn is_running(&self) -> bool {
@@ -821,7 +834,11 @@ impl Workspace {
                     .flex_col()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(Textarea::new(&self.composer))
+                    .child(
+                        Textarea::new(&self.composer)
+                            .accessibility_id("composer")
+                            .aria_label("Message"),
+                    )
                     .child(
                         div()
                             .flex()
@@ -864,7 +881,7 @@ fn tool_output(tool: &Value) -> SharedString {
             }
             if item["type"] == "diff" {
                 parts.push(format!(
-                    "{}\n```diff\n- {}\n+ {}\n```",
+                    "{}\nBefore:\n```\n{}\n```\nAfter:\n```\n{}\n```",
                     item["path"].as_str().unwrap_or("File change"),
                     item["oldText"].as_str().unwrap_or_default(),
                     item["newText"].as_str().unwrap_or_default()
@@ -1003,5 +1020,147 @@ impl Drop for Workspace {
     fn drop(&mut self) {
         self.requests.close();
         self._backend.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Page, Workspace};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use std::sync::Arc;
+    use t3_server::{Server, ServerOptions};
+
+    #[gpui_kit::test]
+    fn command_palette_routes_to_settings_and_changes_the_agent(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(super::bind_keys);
+        let directory = tempfile::tempdir().unwrap();
+        let server = Server::open(ServerOptions::new(directory.path())).unwrap();
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let shutdown = server.clone();
+        let runtime_for_window = runtime.clone();
+        let (handle, workspace) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1200.), px(800.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                move |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(
+                            server,
+                            runtime_for_window,
+                            "127.0.0.1:3773".parse().unwrap(),
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("commands", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.press("down", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(matches!(workspace.read(cx).page, Page::Settings)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("codex", cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(workspace.read(cx).provider, "codex"));
+        cx.update_window(handle, |_, window, cx| {
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-n"
+                } else {
+                    "ctrl-n"
+                },
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(matches!(workspace.read(cx).page, Page::Project)));
+        // Server replies may arrive after the user edits or changes threads.
+        let snapshot = |id: &str| serde_json::json!({"snapshotSequence":0,"thread":{"id":id,"projectId":"project","status":"idle"},"messages":[]});
+        cx.update_window(handle, |_, window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.receive(
+                    crate::backend::Update::Thread {
+                        id: "first".into(),
+                        snapshot: snapshot("first"),
+                        reset: true,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            let composer: gpui_kit::ElementId =
+                ("input", workspace.read(cx).composer.entity_id()).into();
+            window.click(composer.clone(), cx);
+            window.input("new draft", cx);
+            workspace.update(cx, |this, cx| {
+                this.receive(
+                    crate::backend::Update::Completed {
+                        submitted: Some(("first".into(), "older prompt".into())),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find(composer.clone()).value(), Some("new draft"));
+            workspace.update(cx, |this, cx| {
+                this.receive(
+                    crate::backend::Update::Thread {
+                        id: "second".into(),
+                        snapshot: snapshot("second"),
+                        reset: true,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            let composer: gpui_kit::ElementId =
+                ("input", workspace.read(cx).composer.entity_id()).into();
+            window.click(composer.clone(), cx);
+            window.input("second draft", cx);
+            workspace.update(cx, |this, cx| {
+                this.receive(
+                    crate::backend::Update::Completed {
+                        submitted: Some(("first".into(), "new draft".into())),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find(composer.clone()).value(), Some("second draft"));
+        })
+        .unwrap();
+        runtime.block_on(shutdown.shutdown());
     }
 }

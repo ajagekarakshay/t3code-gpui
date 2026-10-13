@@ -5,6 +5,21 @@ use serde_json::{Value, json};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use t3_connect::{Tunnel, TunnelConfiguration};
 
+#[derive(Debug)]
+pub(crate) enum ConnectError {
+    Unauthorized,
+    Unavailable(Value),
+}
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unauthorized => "Relay proof was rejected",
+            Self::Unavailable(_) => "The managed endpoint is unavailable",
+        })
+    }
+}
+impl std::error::Error for ConnectError {}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayConfiguration {
@@ -145,13 +160,20 @@ impl Services {
         self.identity.sign(t3_connect::LINK_PROOF_TYPE,&json!({"iss":format!("t3-env:{id}"),"aud":relay,"sub":id,"jti":uuid::Uuid::new_v4().to_string(),"iat":timestamp,"exp":timestamp+300,"challenge":input["challenge"].as_str().context("Missing challenge")?,"descriptor":self.descriptor,"environmentId":id,"environmentPublicKey":self.identity.public_pem()?.trim(),"endpoint":input["endpoint"],"origin":origin,"scopes":scopes}))
     }
     pub(crate) async fn configure_relay(self: &Arc<Self>, input: Value) -> Result<Value> {
-        let configuration: RelayConfiguration = serde_json::from_value(input)?;
+        let mut configuration: RelayConfiguration = serde_json::from_value(input)?;
         configuration.validate()?;
         let mut cloud = self.cloud.lock().await;
         self.store
             .set_metadata("relayConfig", &serde_json::to_string(&configuration)?)?;
-        self.activate_tunnel(&mut cloud, configuration.endpoint_runtime.as_ref(), false)
-            .await;
+        if !self
+            .confirm_and_activate(&mut cloud, &mut configuration)
+            .await?
+        {
+            self.retry_registration(cloud.generation).await;
+        }
+        if cloud.status["status"] == "failed" {
+            return Err(ConnectError::Unavailable(cloud.status.clone()).into());
+        }
         Ok(json!({"ok":true,"endpointRuntimeStatus":cloud.status}))
     }
     pub(crate) async fn link_state(&self) -> Result<Value> {
@@ -175,7 +197,7 @@ impl Services {
         let mut cloud = self.cloud.lock().await;
         // Remove authority and preferences together before reporting the environment unlinked.
         self.store
-            .remove_metadata(&["relayConfig", "relayPreferences"])?;
+            .remove_metadata(&["relayConfig", "relayPreferences", "relayOrigin"])?;
         cloud.stop().await;
         Ok(json!({"ok":true,"endpointRuntimeStatus":cloud.status}))
     }
@@ -217,13 +239,14 @@ impl Services {
             &relay,
             &format!("t3-env:{id}"),
             auth::epoch(),
-        )?;
-        ensure!(
-            claims["environmentId"] == id
-                && claims["sub"] == configuration.cloud_user_id
-                && claims["scope"] == json!([scope]),
-            "Relay authority mismatch"
-        );
+        )
+        .map_err(|_| ConnectError::Unauthorized)?;
+        if !(claims["environmentId"] == id
+            && claims["sub"] == configuration.cloud_user_id
+            && claims["scope"] == json!([scope]))
+        {
+            return Err(ConnectError::Unauthorized.into());
+        }
         Ok((claims, relay))
     }
     pub(crate) async fn relay_health(&self, input: &Value) -> Result<Value> {
@@ -270,29 +293,78 @@ impl Services {
         cloud.origin = Some(json!({"localHttpHost":host,"localHttpPort":address.port()}));
         if self.store.metadata("relayConfig")?.is_some() {
             let mut configuration = self.relay_configuration()?;
+            if !self
+                .confirm_and_activate(&mut cloud, &mut configuration)
+                .await?
+            {
+                self.retry_registration(cloud.generation).await;
+            }
+        }
+        Ok(())
+    }
+    fn confirm_and_activate<'a>(
+        self: &'a Arc<Self>,
+        cloud: &'a mut CloudState,
+        configuration: &'a mut RelayConfiguration,
+    ) -> futures::future::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
             if configuration
                 .endpoint_runtime
                 .as_ref()
                 .is_some_and(|v| v.provider_kind() == "cloudflare_tunnel")
             {
-                // Register the actual bound origin before starting an old token after a restart.
-                match self
-                    .reconcile_tunnel(&mut configuration, cloud.origin.as_ref().unwrap(), false)
+                let result = if let Some(origin) = &cloud.origin {
+                    self.reconcile_tunnel(configuration, origin, false).await
+                } else {
+                    Err(anyhow::anyhow!("The environment listener is not started"))
+                };
+                if let Err(error) = result {
+                    cloud.stop().await;
+                    cloud.status = runtime_status(
+                        configuration.endpoint_runtime.as_ref().unwrap(),
+                        json!({"status":"failed","failure":"spawn-failed","reason":"Could not confirm the tunnel origin. Retrying."}),
+                    );
+                    tracing::warn!(%error,"Could not confirm the tunnel origin");
+                    return Ok(false);
+                }
+                self.store.set_metadata_batch(&[
+                    ("relayConfig", serde_json::to_string(configuration)?),
+                    ("relayOrigin", cloud.origin.as_ref().unwrap().to_string()),
+                ])?;
+            }
+            self.activate_tunnel(cloud, configuration.endpoint_runtime.as_ref(), false)
+                .await;
+            Ok(true)
+        })
+    }
+    async fn retry_registration(self: &Arc<Self>, generation: u64) {
+        let services = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            let mut generation = generation;
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let Some(services) = services.upgrade() else {
+                    return;
+                };
+                let mut cloud = services.cloud.lock().await;
+                if cloud.generation != generation {
+                    return;
+                }
+                let Ok(mut configuration) = services.relay_configuration() else {
+                    return;
+                };
+                match services
+                    .confirm_and_activate(&mut cloud, &mut configuration)
                     .await
                 {
-                    Ok(()) => {
-                        self.store
-                            .set_metadata("relayConfig", &serde_json::to_string(&configuration)?)?;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error,"Could not register tunnel recovery; keeping existing connector configuration");
-                    }
+                    Ok(true) => return,
+                    _ => generation = cloud.generation,
                 }
             }
-            self.activate_tunnel(&mut cloud, configuration.endpoint_runtime.as_ref(), false)
-                .await;
-        }
-        Ok(())
+        });
+        let mut tasks = self.tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
     async fn relay_request(
         &self,
@@ -684,6 +756,35 @@ mod tests {
             configuration.endpoint_runtime.as_ref().unwrap().tunnel_id(),
             Some("replacement-tunnel")
         );
+        server.shutdown().await;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn a_tunnel_cannot_start_until_its_current_origin_is_confirmed() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let server = Server::open(ServerOptions::new(directory.path()))?;
+        let mut configuration = RelayConfiguration {
+            relay_url: "https://relay.fixture.test".into(),
+            relay_issuer: None,
+            cloud_user_id: "user".into(),
+            environment_credential: "credential".into(),
+            cloud_mint_public_key: t3_connect::EnvironmentIdentity::generate().public_pem()?,
+            endpoint_runtime: Some(serde_json::from_value(
+                json!({"providerKind":"cloudflare_tunnel","connectorToken":"stale-token","tunnelId":"tunnel"}),
+            )?),
+        };
+        let mut cloud = server.services.cloud.lock().await;
+        // No listener origin has been established. No executable lookup or child spawn is allowed.
+        assert!(
+            !server
+                .services
+                .confirm_and_activate(&mut cloud, &mut configuration)
+                .await?
+        );
+        assert!(cloud.tunnel.is_none());
+        assert_eq!(cloud.status["status"], "failed");
+        assert!(server.services.store.metadata("relayOrigin")?.is_none());
+        drop(cloud);
         server.shutdown().await;
         Ok(())
     }

@@ -136,6 +136,16 @@ impl Server {
             .route("/api/t3-connect/mint-credential", post(relay_mint))
             .route("/ws", get(websocket))
             .with_state(self.services.clone())
+            .layer(axum::middleware::from_fn(
+                |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    let mut response = next.run(request).await;
+                    response.headers_mut().insert(
+                        "cache-control",
+                        axum::http::HeaderValue::from_static("no-store"),
+                    );
+                    response
+                },
+            ))
     }
 
     pub fn descriptor(&self) -> &Value {
@@ -198,15 +208,41 @@ impl Server {
     }
 }
 
-struct ApiError(StatusCode, String);
+struct ApiError(StatusCode, Value);
+impl ApiError {
+    fn new(status: StatusCode, message: impl std::fmt::Display) -> Self {
+        let tag = match status {
+            StatusCode::UNAUTHORIZED => "EnvironmentHttpUnauthorizedError",
+            StatusCode::FORBIDDEN => "EnvironmentHttpForbiddenError",
+            StatusCode::CONFLICT => "EnvironmentHttpConflictError",
+            StatusCode::SERVICE_UNAVAILABLE => "EnvironmentCloudEndpointUnavailableError",
+            _ => "EnvironmentHttpBadRequestError",
+        };
+        Self(status, json!({"_tag":tag,"message":message.to_string()}))
+    }
+}
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        Self(StatusCode::BAD_REQUEST, error.to_string())
+        if let Some(crate::cloud::ConnectError::Unavailable(status)) =
+            error.downcast_ref::<crate::cloud::ConnectError>()
+        {
+            let mut response = Self::new(StatusCode::SERVICE_UNAVAILABLE, &error);
+            response.1["endpointRuntimeStatus"] = status.clone();
+            return response;
+        }
+        let status = if error.is::<crate::cloud::ConnectError>() {
+            StatusCode::UNAUTHORIZED
+        } else if error.is::<auth::ProofReplayed>() {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        Self::new(status, error)
     }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0,Json(json!({"code":if self.0==StatusCode::UNAUTHORIZED{"auth_invalid"}else{"invalid_request"},"message":self.1,"traceId":uuid::Uuid::new_v4().to_string()}))).into_response()
+        (self.0, Json(self.1)).into_response()
     }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
@@ -241,11 +277,11 @@ fn authenticate(
             method,
             &request_url(headers, uri)?,
         )
-        .map_err(|error| ApiError(StatusCode::UNAUTHORIZED, error.to_string()))?;
+        .map_err(|error| ApiError::new(StatusCode::UNAUTHORIZED, error))?;
     if let Some(scope) = scope {
         session
             .require(scope)
-            .map_err(|error| ApiError(StatusCode::FORBIDDEN, error.to_string()))?;
+            .map_err(|error| ApiError::new(StatusCode::FORBIDDEN, error))?;
     }
     Ok(session)
 }
@@ -266,7 +302,7 @@ async fn exchange(
                 headers.get("dpop").and_then(|v| v.to_str().ok()),
                 &request_url(&headers, &uri)?,
             )
-            .map_err(|error| ApiError(StatusCode::UNAUTHORIZED, error.to_string()))?,
+            .map_err(|error| ApiError::new(StatusCode::UNAUTHORIZED, error))?,
     ))
 }
 async fn session(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
@@ -347,7 +383,6 @@ async fn relay_configuration(
     Json(input): Json<Value>,
 ) -> ApiResult {
     authenticate(&s, &h, &u, "POST", Some("relay:write"))?;
-    reject_forwarded(&h)?;
     Ok(Json(s.configure_relay(input).await?))
 }
 async fn link_state(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
@@ -368,20 +403,10 @@ async fn cloud_preferences(
     s.save_cloud_preferences(input).await?;
     Ok(Json(Value::Null))
 }
-async fn relay_health(
-    State(s): State<Arc<Services>>,
-    h: HeaderMap,
-    Json(input): Json<Value>,
-) -> ApiResult {
-    reject_forwarded(&h)?;
+async fn relay_health(State(s): State<Arc<Services>>, Json(input): Json<Value>) -> ApiResult {
     Ok(Json(s.relay_health(&input).await?))
 }
-async fn relay_mint(
-    State(s): State<Arc<Services>>,
-    h: HeaderMap,
-    Json(input): Json<Value>,
-) -> ApiResult {
-    reject_forwarded(&h)?;
+async fn relay_mint(State(s): State<Arc<Services>>, Json(input): Json<Value>) -> ApiResult {
     Ok(Json(s.relay_mint(&input).await?))
 }
 
@@ -397,7 +422,7 @@ async fn websocket(
     } else {
         s.store
             .redeem_ticket(query.get("wsTicket").context("WebSocket ticket required")?)
-            .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, e.to_string()))?
+            .map_err(|e| ApiError::new(StatusCode::UNAUTHORIZED, e))?
     };
     Ok(upgrade
         .max_message_size(8 * 1024 * 1024)
