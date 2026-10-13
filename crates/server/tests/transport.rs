@@ -181,6 +181,31 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         "Compatible thread"
     );
     socket.send(Message::Text(json!([
+        {"_tag":"Request","id":"search-threads","tag":"orchestration.searchThreads","payload":{"query":"missing","limit":10},"headers":[]},
+        {"_tag":"Request","id":"search-thread","tag":"orchestration.searchThread","payload":{"threadId":"thread","query":"missing"},"headers":[]},
+        {"_tag":"Request","id":"search-stream","tag":"orchestration.searchThreadStream","payload":{"threadId":"thread","query":"missing"},"headers":[]}
+    ]).to_string().into())).await?;
+    let search_threads: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert!(
+        search_threads["exit"]["value"]["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let search_thread: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(search_thread["exit"]["value"]["complete"], true);
+    assert_eq!(search_thread["exit"]["value"]["totalMatches"], 0);
+    let search_stream: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(search_stream["_tag"], "Chunk");
+    assert_eq!(search_stream["values"][0]["match"], Value::Null);
+    socket
+        .send(Message::Text(
+            json!({"_tag":"Interrupt","requestId":"search-stream"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    socket.send(Message::Text(json!([
         {"_tag":"Request","id":"config","tag":"server.getConfig","payload":{},"headers":[]},
         {"_tag":"Request","id":"thread-subscription","tag":"orchestration.subscribeThread","payload":{"threadId":"thread"},"headers":[]}
     ]).to_string().into())).await?;

@@ -610,6 +610,175 @@ impl Store {
         )?)
     }
 
+    pub(crate) fn search_threads(&self, input: &Value) -> Result<Value> {
+        let query = required(input, "query")?;
+        ensure!(
+            (2..=200).contains(&query.chars().count()),
+            "Search query must contain 2 to 200 characters"
+        );
+        let limit = input["limit"].as_u64().unwrap_or(50);
+        ensure!((1..=50).contains(&limit), "Invalid search result limit");
+        let pattern = format!("%{}%", escape_like(query));
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "WITH candidate AS (
+                SELECT
+                    t.id AS thread_id,
+                    json_extract(t.value,'$.projectId') AS project_id,
+                    json_extract(m.value,'$.role') AS role,
+                    json_extract(m.value,'$.text') AS match_text,
+                    json_extract(m.value,'$.createdAt') AS message_created_at,
+                    json_extract(t.value,'$.updatedAt') AS thread_updated_at,
+                    m.rowid AS message_order
+                FROM messages m
+                JOIN threads t ON t.id=m.thread_id
+                JOIN projects p ON p.id=json_extract(t.value,'$.projectId')
+                WHERE json_extract(t.value,'$.deletedAt') IS NULL
+                  AND json_extract(t.value,'$.archivedAt') IS NULL
+                  AND json_extract(p.value,'$.deletedAt') IS NULL
+                  AND COALESCE(json_extract(m.value,'$.streaming'),0)=0
+                  AND json_extract(m.value,'$.role') IN ('user','assistant')
+                  AND json_extract(m.value,'$.text') LIKE ?1 ESCAPE '!'
+            ), ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY thread_id
+                    ORDER BY CASE role WHEN 'user' THEN 0 ELSE 1 END,
+                             message_created_at DESC,
+                             message_order ASC
+                ) AS match_rank
+                FROM candidate
+            )
+            SELECT thread_id,project_id,role,match_text,message_created_at
+            FROM ranked
+            WHERE match_rank=1
+            ORDER BY CASE role WHEN 'user' THEN 0 ELSE 1 END,
+                     thread_updated_at DESC,
+                     thread_id ASC
+            LIMIT ?2",
+        )?;
+        let matches = statement
+            .query_map(params![pattern, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (thread_id, project_id, source, text, created_at) = row?;
+                Ok::<_, anyhow::Error>(json!({
+                    "threadId":thread_id,
+                    "projectId":project_id,
+                    "source":source,
+                    "snippet":search_snippet(&text,query),
+                    "messageCreatedAt":created_at
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({"matches":matches}))
+    }
+
+    pub(crate) fn search_thread(&self, input: &Value) -> Result<Value> {
+        let thread_id = required(input, "threadId")?;
+        let query = required(input, "query")?;
+        ensure!(query.chars().count() <= 200, "Search query is too long");
+        let connection = self.lock()?;
+        let thread: Value = read_record(&connection, "threads", thread_id)?;
+        ensure!(thread["deletedAt"].is_null(), "Thread was deleted");
+        let snapshot_sequence: i64 =
+            connection.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+        let mut statement =
+            connection.prepare("SELECT value FROM messages WHERE thread_id=? ORDER BY rowid")?;
+        let rows = statement
+            .query_map([thread_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut documents = Vec::new();
+        let mut start_index = 0_u64;
+        for row in rows {
+            let message: Value = serde_json::from_str(&row)?;
+            if !matches!(message["role"].as_str(), Some("user" | "assistant"))
+                || message["streaming"] == true
+            {
+                continue;
+            }
+            let count = count_occurrences(message["text"].as_str().unwrap_or_default(), query);
+            if count == 0 {
+                continue;
+            }
+            documents.push(json!({
+                "entryId":required(&message,"id")?,
+                "runId":message["runId"],
+                "startIndex":start_index,
+                "count":count
+            }));
+            start_index += count;
+        }
+        let total_matches = start_index;
+        let explicit_index = input.get("index").and_then(Value::as_u64);
+        let mut requested_index = explicit_index.unwrap_or(0);
+        if explicit_index.is_none()
+            && let Some(start) = input.get("start")
+            && let Some(document) = documents
+                .iter()
+                .find(|document| document["entryId"] == start["entryId"])
+        {
+            requested_index = document["startIndex"].as_u64().unwrap_or(0)
+                + start["occurrence"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(document["count"].as_u64().unwrap_or(0));
+            if requested_index >= total_matches {
+                requested_index = 0;
+            }
+        }
+        let active_index = if total_matches == 0 {
+            0
+        } else if explicit_index.is_some() {
+            requested_index.min(total_matches - 1)
+        } else {
+            (requested_index as i128 + input["offset"].as_i64().unwrap_or(0) as i128)
+                .rem_euclid(total_matches as i128) as u64
+        };
+        let selected = documents.iter().find(|document| {
+            let start = document["startIndex"].as_u64().unwrap_or(0);
+            let count = document["count"].as_u64().unwrap_or(0);
+            active_index >= start && active_index < start + count
+        });
+        let matched = selected.map_or(Value::Null, |document| {
+            json!({
+                "entryId":document["entryId"],
+                "runId":document["runId"],
+                "occurrence":active_index-document["startIndex"].as_u64().unwrap_or(0)
+            })
+        });
+        let navigation = if documents.len() <= 17 {
+            documents
+        } else {
+            let selected_index = documents
+                .iter()
+                .position(|document| Some(document) == selected)
+                .unwrap_or(0);
+            (0..17)
+                .map(|offset| {
+                    documents[(selected_index + offset + documents.len() - 8) % documents.len()]
+                        .clone()
+                })
+                .collect()
+        };
+        Ok(json!({
+            "complete":true,
+            "snapshotSequence":snapshot_sequence,
+            "totalMatches":total_matches,
+            "activeIndex":active_index,
+            "match":matched,
+            "navigation":navigation
+        }))
+    }
+
     /// Replay committed changes in bounded pages; the cursor advances only after delivery.
     pub(crate) fn changes_after(&self, after: i64) -> Result<Value> {
         ensure!(after >= 0, "Invalid event cursor");
@@ -1394,6 +1563,52 @@ fn append_event(
     )?;
     Ok(tx.last_insert_rowid())
 }
+fn escape_like(value: &str) -> String {
+    value
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_")
+}
+
+fn count_occurrences(text: &str, query: &str) -> u64 {
+    let text = text.to_lowercase().replace('ς', "σ");
+    let query = query.to_lowercase().replace('ς', "σ");
+    if query.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut remaining = text.as_str();
+    while let Some(index) = remaining.find(&query) {
+        count += 1;
+        remaining = &remaining[index + query.len()..];
+    }
+    count
+}
+
+fn search_snippet(text: &str, query: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let characters = normalized.chars().collect::<Vec<_>>();
+    if characters.len() <= 240 {
+        return normalized;
+    }
+    let folded = normalized.to_ascii_lowercase();
+    let query = query.to_ascii_lowercase();
+    let match_character = folded
+        .find(&query)
+        .map(|byte| folded[..byte].chars().count())
+        .unwrap_or(0);
+    let start = match_character
+        .saturating_sub(72)
+        .min(characters.len().saturating_sub(238));
+    let end = (start + 238).min(characters.len());
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        characters[start..end].iter().collect::<String>(),
+        if end < characters.len() { "…" } else { "" }
+    )
+}
+
 fn records(connection: &Connection, query: &str) -> Result<Vec<Value>> {
     let mut query = connection.prepare(query)?;
     let rows: Vec<String> = query
@@ -1686,6 +1901,50 @@ mod tests {
             "saved"
         );
         assert_eq!(compatible["projection"]["runs"][0]["status"], "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn searches_thread_messages_without_loading_full_snapshots() -> Result<()> {
+        let (_directory, store) = setup()?;
+        let mut first = message();
+        first["text"] = json!("Needle needle in the user request");
+        store.dispatch(&first)?;
+        store.agent_event(
+            "thread",
+            &json!({"type":"acp.turn.finished","data":{"stopReason":"end_turn"}}),
+            Some("Assistant found another needle"),
+            true,
+            None,
+        )?;
+
+        let first_match = store.search_thread(&json!({"threadId":"thread","query":"needle"}))?;
+        assert_eq!(first_match["complete"], true);
+        assert_eq!(first_match["totalMatches"], 3);
+        assert_eq!(first_match["activeIndex"], 0);
+        assert_eq!(first_match["match"]["entryId"], "message");
+        assert_eq!(first_match["match"]["occurrence"], 0);
+        let next =
+            store.search_thread(&json!({"threadId":"thread","query":"needle","offset":2}))?;
+        assert_eq!(next["activeIndex"], 2);
+        assert!(
+            next["match"]["entryId"]
+                .as_str()
+                .unwrap()
+                .starts_with("assistant:")
+        );
+
+        let environment = store.search_threads(&json!({"query":"needle","limit":10}))?;
+        assert_eq!(environment["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(environment["matches"][0]["threadId"], "thread");
+        assert_eq!(environment["matches"][0]["projectId"], "project");
+        assert_eq!(environment["matches"][0]["source"], "user");
+        assert!(
+            environment["matches"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("Needle needle")
+        );
         Ok(())
     }
 }

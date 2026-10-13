@@ -858,6 +858,7 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                         "orchestration.subscribeShell"
                         | "orchestration.subscribeArchivedShell"
                         | "orchestration.subscribeThread"
+                        | "orchestration.searchThreadStream"
                         | "subscribeServerConfig"
                         | "subscribeServerLifecycle"
                         | "subscribeAuthAccess"
@@ -887,6 +888,7 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
                         "subscribeAuthAccess" => change["authAccess"] == true,
                         "subscribeServerConfig" | "subscribeServerLifecycle" | "provider.auth.subscribe" => false,
                         "orchestration.subscribeShell" | "orchestration.subscribeArchivedShell" | "rust.subscribeEvents" => true,
+                        "orchestration.searchThreadStream" => change["threadId"]==subscription.input["threadId"],
                         _ => change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"],
                     };
                     if relevant {
@@ -1016,6 +1018,10 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         }
         "orchestration.getThreadProjection" => {
             Ok(s.store.compatible_thread(required(input, "threadId")?)?["projection"].clone())
+        }
+        "orchestration.searchThreads" => s.store.search_threads(input),
+        "orchestration.searchThread" | "orchestration.searchThreadStream" => {
+            s.store.search_thread(input)
         }
         "orchestration.subscribeThread" => {
             if input["acceptBoundedSnapshot"] == true {
