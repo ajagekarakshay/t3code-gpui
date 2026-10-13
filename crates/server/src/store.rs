@@ -920,17 +920,26 @@ impl Store {
                     !active || queued,
                     "Use queue-after-active while this ACP turn is running"
                 );
-                ensure!(
-                    command
-                        .get("attachments")
-                        .and_then(Value::as_array)
-                        .is_none_or(Vec::is_empty),
-                    "Attachments are not ported yet"
-                );
+                let attachments = command["attachments"]
+                    .as_array()
+                    .context("Attachments must be an array")?;
+                ensure!(attachments.len() <= 100, "Too many attachments");
+                for attachment in attachments {
+                    ensure!(
+                        matches!(required(attachment, "type")?, "image" | "file"),
+                        "Unsupported attachment type"
+                    );
+                    required(attachment, "id")?;
+                    required(attachment, "name")?;
+                    required(attachment, "mimeType")?;
+                    attachment["sizeBytes"]
+                        .as_u64()
+                        .context("Invalid attachment size")?;
+                }
                 let text = required(command, "text")?;
                 let message_id = required(command, "messageId")?;
                 let run_id = uuid::Uuid::new_v4().to_string();
-                let message = json!({"id":message_id,"threadId":id,"runId":run_id,"nodeId":null,"role":"user","text":text,"attachments":[],"streaming":false,"runStatus":if queued {"queued"} else {"starting"},"runStartedAt":if queued {Value::Null} else {json!(timestamp)},"runCompletedAt":null,"providerInstanceId":thread["providerInstanceId"],"modelSelection":thread["modelSelection"],"createdAt":timestamp,"updatedAt":timestamp,"createdBy":command.get("createdBy").cloned().unwrap_or_else(||thread["createdBy"].clone()),"creationSource":command.get("creationSource").cloned().unwrap_or_else(||thread["creationSource"].clone())});
+                let message = json!({"id":message_id,"threadId":id,"runId":run_id,"nodeId":null,"role":"user","text":text,"attachments":command["attachments"],"streaming":false,"runStatus":if queued {"queued"} else {"starting"},"runStartedAt":if queued {Value::Null} else {json!(timestamp)},"runCompletedAt":null,"providerInstanceId":thread["providerInstanceId"],"modelSelection":thread["modelSelection"],"createdAt":timestamp,"updatedAt":timestamp,"createdBy":command.get("createdBy").cloned().unwrap_or_else(||thread["createdBy"].clone()),"creationSource":command.get("creationSource").cloned().unwrap_or_else(||thread["creationSource"].clone())});
                 ensure!(
                     !exists(&tx, "messages", message_id)?,
                     "Message ID already exists"

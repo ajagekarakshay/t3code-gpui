@@ -16,7 +16,28 @@ impl Services {
             ensure!(root.is_dir(), "Project root must be a directory");
             command["workspaceRoot"] = json!(root);
         }
+        let mut claimed_pending = Vec::new();
+        if kind == "message.dispatch" {
+            let thread_id = required(&command, "threadId")?.to_owned();
+            if command.get("attachments").is_none() {
+                command["attachments"] = json!([]);
+            }
+            claimed_pending = command["attachments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|attachment| attachment["id"].as_str())
+                .filter(|id| id.starts_with("pending-"))
+                .map(str::to_owned)
+                .collect();
+            self.attachments
+                .claim(&thread_id, &mut command["attachments"])
+                .await?;
+        }
         let result = self.store.dispatch(&command)?;
+        for attachment_id in claimed_pending {
+            let _ = self.attachments.delete_pending(&attachment_id).await;
+        }
         if kind == "provider.switch"
             && let Some(thread_id) = command["threadId"].as_str()
             && let Some(session) = self.sessions.lock().await.remove(thread_id)
@@ -110,8 +131,8 @@ impl Services {
         if let Some(message) = input.get("initialMessage") {
             required(message, "text")?;
             ensure!(
-                message["attachments"].as_array().is_none_or(Vec::is_empty),
-                "Attachments are not ported yet"
+                message["attachments"].as_array().is_some(),
+                "Attachments must be an array"
             );
         }
         if reuse {
@@ -312,7 +333,15 @@ impl Services {
             session
         };
         drop(sessions);
-        session.prompt(required(command, "text")?.into()).await
+        let empty_attachments = Value::Array(Vec::new());
+        let content = self
+            .attachments
+            .prompt(
+                required(command, "text")?.into(),
+                command.get("attachments").unwrap_or(&empty_attachments),
+            )
+            .await?;
+        session.send(SessionCommand::Prompt(content)).await
     }
 
     async fn record_agent_event(

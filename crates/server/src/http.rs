@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
+    body::{Body, Bytes, to_bytes},
     extract::{
         Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -58,6 +59,7 @@ pub(crate) struct Services {
     pub(crate) changes: broadcast::Sender<Value>,
     pub(crate) effects: Mutex<()>,
     pub(crate) filesystem: crate::filesystem::WorkspaceFilesystem,
+    pub(crate) attachments: crate::attachments::AttachmentStore,
     pub(crate) tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub(crate) identity: EnvironmentIdentity,
     pub(crate) descriptor: Value,
@@ -100,7 +102,7 @@ impl Server {
             _ => "other",
         };
         // Do not advertise full V2 parity while the Rust projections are being ported.
-        let descriptor = json!({"environmentId":id,"label":options.label,"platform":{"os":os,"arch":arch},"serverVersion":env!("CARGO_PKG_VERSION"),"orchestrationProtocolVersion":2,"capabilities":{"repositoryIdentity":false,"serverResolvedCommandContext":true},"rustMigration":true});
+        let descriptor = json!({"environmentId":id,"label":options.label,"platform":{"os":os,"arch":arch},"serverVersion":env!("CARGO_PKG_VERSION"),"orchestrationProtocolVersion":2,"capabilities":{"repositoryIdentity":false,"serverResolvedCommandContext":true,"attachmentUploads":true,"fileAttachments":{"maxUploadBytes":52428800}},"rustMigration":true});
         let (changes, _) = broadcast::channel(256);
         Ok(Self {
             services: Arc::new(Services {
@@ -113,6 +115,7 @@ impl Server {
                 changes,
                 effects: Mutex::default(),
                 filesystem: crate::filesystem::WorkspaceFilesystem::default(),
+                attachments: crate::attachments::AttachmentStore::new(&home),
                 tasks: Mutex::default(),
                 identity,
                 descriptor,
@@ -151,6 +154,8 @@ impl Server {
             .route("/api/projects", get(projects))
             .route("/api/projects/mutate", post(dispatch))
             .route("/api/rust/dispatch", post(dispatch))
+            .route("/api/attachments/upload/{token}", post(upload_attachment))
+            .route("/api/assets/{token}", get(read_asset))
             .route("/api/connect/link-proof", post(link_proof))
             .route("/api/connect/relay-config", post(relay_configuration))
             .route("/api/connect/link-state", get(link_state))
@@ -453,6 +458,42 @@ fn authenticate(
 }
 async fn descriptor(State(services): State<Arc<Services>>) -> Json<Value> {
     Json(services.descriptor.clone())
+}
+
+async fn upload_attachment(
+    State(services): State<Arc<Services>>,
+    Path(token): Path<String>,
+    body: Body,
+) -> Response {
+    let bytes: Bytes = match to_bytes(body, 50 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    match services.attachments.store_upload(&token, &bytes).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => ApiError::from(error).into_response(),
+    }
+}
+
+async fn read_asset(State(services): State<Arc<Services>>, Path(token): Path<String>) -> Response {
+    match services.attachments.read_asset(&token).await {
+        Ok(Some(asset)) => {
+            let disposition = format!(
+                "{}; filename=\"{}\"",
+                asset.disposition,
+                asset.file_name.replace(['"', '\r', '\n'], "_")
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", asset.mime_type)
+                .header("content-disposition", disposition)
+                .body(Body::from(asset.bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => ApiError::from(error).into_response(),
+    }
 }
 async fn exchange(
     State(services): State<Arc<Services>>,
@@ -924,6 +965,8 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         "orchestration.dispatchCommand"
         | "orchestration.launchThread"
         | "projects.mutate"
+        | "attachments.createUploadUrl"
+        | "attachments.delete"
         | "rust.cancel"
         | "rust.answerPermission" => "orchestration:operate",
         _ => "orchestration:read",
@@ -1002,6 +1045,14 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         "projects.writeFile" => {
             crate::filesystem::write_file(s.filesystem.clone(), input.clone()).await
         }
+        "attachments.createUploadUrl" => s.attachments.issue_upload(input).await,
+        "attachments.delete" => {
+            s.attachments
+                .delete_pending(required(input, "attachmentId")?)
+                .await?;
+            Ok(Value::Null)
+        }
+        "assets.createUrl" => s.attachments.issue_asset(input).await,
         "subscribeVcsStatus" => Ok(crate::vcs::status_stream_snapshot(
             crate::vcs::status(input).await?,
         )),

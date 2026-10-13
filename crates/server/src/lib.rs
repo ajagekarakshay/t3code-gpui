@@ -1,6 +1,7 @@
 //! Environment-owned services and compatible HTTP/WebSocket transports.
 
 mod activity;
+mod attachments;
 mod auth;
 mod cloud;
 mod filesystem;

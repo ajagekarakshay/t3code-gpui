@@ -180,6 +180,81 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         thread_snapshot["projection"]["thread"]["title"],
         "Compatible thread"
     );
+    socket
+        .send(Message::Text(
+            json!({"_tag":"Request","id":"attachment-upload","tag":"attachments.createUploadUrl","payload":{"type":"image","name":"pixel.png","mimeType":"image/png","sizeBytes":6},"headers":[]})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    let upload: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    let pending_attachment = upload["exit"]["value"]["attachmentId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .post(format!(
+            "{base}{}",
+            upload["exit"]["value"]["relativeUrl"].as_str().unwrap()
+        ))
+        .body("pixels")
+        .send()
+        .await?
+        .error_for_status()?;
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":"attachment-message",
+                "tag":"orchestration.dispatchCommand",
+                "payload":{
+                    "type":"message.dispatch",
+                    "commandId":"attachment-message-command",
+                    "createdBy":"user",
+                    "creationSource":"web",
+                    "threadId":"thread",
+                    "messageId":"attachment-message",
+                    "text":"inspect this image",
+                    "attachments":[{"type":"image","id":pending_attachment,"name":"pixel.png","mimeType":"image/png","sizeBytes":6}],
+                    "dispatchMode":{"type":"start_immediately"}
+                },
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let dispatched: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(dispatched["exit"]["_tag"], "Success");
+    let with_attachment: Value = client
+        .get(format!("{base}/api/orchestration/threads/thread"))
+        .bearer_auth(access)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let attachment = &with_attachment["projection"]["messages"][0]["attachments"][0];
+    assert_ne!(attachment["id"], pending_attachment);
+    socket
+        .send(Message::Text(
+            json!({"_tag":"Request","id":"attachment-asset","tag":"assets.createUrl","payload":{"resource":{"_tag":"attachment","attachmentId":attachment["id"],"fileName":"pixel.png","mimeType":"image/png","disposition":"inline"}},"headers":[]})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    let asset: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    let downloaded = client
+        .get(format!(
+            "{base}{}",
+            asset["exit"]["value"]["relativeUrl"].as_str().unwrap()
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert_eq!(downloaded.as_ref(), b"pixels");
     socket.send(Message::Text(json!([
         {"_tag":"Request","id":"search-threads","tag":"orchestration.searchThreads","payload":{"query":"missing","limit":10},"headers":[]},
         {"_tag":"Request","id":"search-thread","tag":"orchestration.searchThread","payload":{"threadId":"thread","query":"missing"},"headers":[]},
