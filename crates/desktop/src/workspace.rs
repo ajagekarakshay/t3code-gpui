@@ -128,6 +128,8 @@ pub(crate) struct Workspace {
     connect_identity: Option<SharedString>,
     connect_status: SharedString,
     connect_prompt: Option<(SharedString, SharedString)>,
+    connect_publish: bool,
+    connect_hold_webhooks: bool,
     _credentials: Task<()>,
     _connect_credentials: Task<()>,
 }
@@ -271,6 +273,8 @@ impl Workspace {
             connect_identity: None,
             connect_status: "Loading…".into(),
             connect_prompt: None,
+            connect_publish: false,
+            connect_hold_webhooks: false,
             _credentials: credential_task,
             _connect_credentials: connect_credential_task,
         }
@@ -474,6 +478,10 @@ impl Workspace {
                 },
                 None => cx.delete_credentials(CONNECT_CREDENTIAL_KEY).detach(),
             },
+            Update::ConnectPreferences { publish, hold } => {
+                self.connect_publish = publish;
+                self.connect_hold_webhooks = hold;
+            }
         }
         cx.notify();
     }
@@ -791,6 +799,24 @@ impl Workspace {
     }
     fn forget_connect_account(&mut self, cx: &mut Context<Self>) {
         self.request(Request::ForgetConnectAccount, cx);
+    }
+    fn toggle_connect_publish(&mut self, cx: &mut Context<Self>) {
+        self.request(
+            Request::SetConnectPreferences {
+                publish: !self.connect_publish,
+                hold: None,
+            },
+            cx,
+        );
+    }
+    fn toggle_connect_hold(&mut self, cx: &mut Context<Self>) {
+        self.request(
+            Request::SetConnectPreferences {
+                publish: self.connect_publish,
+                hold: Some(!self.connect_hold_webhooks),
+            },
+            cx,
+        );
     }
     fn commands(&mut self, _: &ShowCommands, window: &mut Window, cx: &mut Context<Self>) {
         let palette = self.palette.clone();
@@ -1281,13 +1307,37 @@ impl Render for Workspace {
                     )
                 })
                 .when(self.connect_linked, |settings| {
-                    settings.child(
-                        Button::new("disable-connect")
-                            .label("Disable T3 Connect")
-                            .danger()
-                            .disabled(self.environment_id.is_some())
-                            .on_click(cx.listener(|this, _, _, cx| this.unlink_connect(cx))),
-                    )
+                    settings
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("connect-publish-activity")
+                                        .label("Agent activity notifications")
+                                        .selected(self.connect_publish)
+                                        .disabled(self.environment_id.is_some())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_connect_publish(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("connect-hold-webhooks")
+                                        .label("Hold webhooks while offline")
+                                        .selected(self.connect_hold_webhooks)
+                                        .disabled(self.environment_id.is_some())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_connect_hold(cx)
+                                        })),
+                                ),
+                        )
+                        .child(
+                            Button::new("disable-connect")
+                                .label("Disable T3 Connect")
+                                .danger()
+                                .disabled(self.environment_id.is_some())
+                                .on_click(cx.listener(|this, _, _, cx| this.unlink_connect(cx))),
+                        )
                 })
                 .when(
                     self.connect_identity.is_some()

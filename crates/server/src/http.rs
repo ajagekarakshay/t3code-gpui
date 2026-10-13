@@ -59,6 +59,7 @@ pub(crate) struct Services {
     pub(crate) identity: EnvironmentIdentity,
     pub(crate) descriptor: Value,
     pub(crate) cloud: Mutex<crate::cloud::CloudState>,
+    pub(crate) activity: crate::activity::ActivityQueue,
 }
 
 #[derive(Clone)]
@@ -110,6 +111,7 @@ impl Server {
                 identity,
                 descriptor,
                 cloud: Mutex::new(crate::cloud::CloudState::new(home)),
+                activity: crate::activity::ActivityQueue::default(),
             }),
         })
     }
@@ -238,6 +240,25 @@ impl Server {
     }
     pub async fn connect_state(&self) -> Result<Value> {
         self.services.link_state().await
+    }
+    pub async fn connect_preferences(
+        &self,
+        publish_agent_activity: bool,
+        hold_webhooks_while_offline: Option<bool>,
+    ) -> Result<Value> {
+        let mut preferences = json!({"publishAgentActivity":publish_agent_activity});
+        if let Some(hold) = hold_webhooks_while_offline {
+            preferences["holdWebhooksWhileOffline"] = json!(hold);
+        }
+        self.services.save_cloud_preferences(preferences).await?;
+        self.services.link_state().await
+    }
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn publish_terminal_activity_for_test(&self, thread_id: &str) -> Result<()> {
+        self.services
+            .publish_activity(thread_id, crate::activity::ActivityKind::Terminal)
+            .await
     }
     pub async fn shutdown(&self) {
         self.services.cloud.lock().await.stop().await;

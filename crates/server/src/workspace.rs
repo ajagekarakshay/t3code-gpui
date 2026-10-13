@@ -1,4 +1,4 @@
-use crate::{http::Services, store::required};
+use crate::{activity::ActivityKind, http::Services, store::required};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -20,6 +20,18 @@ impl Services {
         let _ = self.changes.send(
             json!({"type":"changed","threadId":command["threadId"],"sequence":result["sequence"]}),
         );
+        if let Some(thread_id) = command["threadId"].as_str() {
+            let activity = match kind.as_str() {
+                "thread.archive" | "thread.delete" => Some(ActivityKind::Tombstone),
+                "message.dispatch" | "thread.unarchive" | "thread.metadata.update" => {
+                    Some(ActivityKind::Normal)
+                }
+                _ => None,
+            };
+            if let Some(activity) = activity {
+                self.queue_activity(thread_id, activity).await;
+            }
+        }
         let services = self.clone();
         let task = tokio::spawn(async move {
             if let Err(error) = services.execute_pending().await {
@@ -46,6 +58,8 @@ impl Services {
                     Some(&error.to_string()),
                 )?;
                 let _ = self.changes.send(change);
+                self.queue_activity(&thread_id, ActivityKind::Terminal)
+                    .await;
             }
             self.store.complete_effect(id)?;
         }
@@ -107,7 +121,11 @@ impl Services {
         session.prompt(required(command, "text")?.into()).await
     }
 
-    async fn record_agent_event(&self, thread_id: &str, event: AgentEvent) -> Result<()> {
+    async fn record_agent_event(
+        self: &Arc<Self>,
+        thread_id: &str,
+        event: AgentEvent,
+    ) -> Result<()> {
         let (event, text, finished, failure) = match event {
             AgentEvent::AuthenticationRequired(methods) => (
                 json!({"type":"acp.authentication.required","methods":methods}),
@@ -159,6 +177,20 @@ impl Services {
             failure.as_deref(),
         )?;
         let _ = self.changes.send(change);
+        let event_type = event["type"].as_str();
+        if finished || failure.is_some() {
+            self.queue_activity(thread_id, ActivityKind::Terminal).await;
+        } else if matches!(
+            event_type,
+            Some(
+                "acp.ready"
+                    | "acp.permission"
+                    | "acp.authentication.required"
+                    | "acp.permission.answered"
+            )
+        ) {
+            self.queue_activity(thread_id, ActivityKind::Normal).await;
+        }
         Ok(())
     }
 
@@ -215,7 +247,7 @@ impl Services {
     }
 
     pub(crate) async fn answer_permission(
-        &self,
+        self: &Arc<Self>,
         thread_id: &str,
         id: &str,
         option: Option<String>,
@@ -236,6 +268,7 @@ impl Services {
             None,
         )?;
         let _ = self.changes.send(change);
+        self.queue_activity(thread_id, ActivityKind::Normal).await;
         Ok(())
     }
 }

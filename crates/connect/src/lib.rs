@@ -12,6 +12,7 @@ pub use identity::{EnvironmentIdentity, validate_relay_key, verify_relay_proof};
 pub use tunnel::{Tunnel, TunnelConfiguration, TunnelState};
 
 pub const LINK_PROOF_TYPE: &str = "t3-env-link+jwt";
+pub const ACTIVITY_PUBLISH_TYPE: &str = "t3-env-activity+jwt";
 pub const MINT_REQUEST_TYPE: &str = "t3-cloud-mint+jwt";
 pub const HEALTH_REQUEST_TYPE: &str = "t3-cloud-health+jwt";
 pub const MINT_RESPONSE_TYPE: &str = "t3-env-mint+jwt";

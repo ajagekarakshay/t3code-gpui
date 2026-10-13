@@ -284,9 +284,12 @@ async fn account_link_sequence_configures_and_revokes_the_local_environment() ->
 
     struct RelayState {
         environment_id: String,
-        public_key: String,
+        relay_public_key: String,
+        environment_public_key: Option<String>,
         linked: bool,
         unlinked: bool,
+        hold_webhooks: bool,
+        activities: Vec<Value>,
     }
 
     async fn challenge(headers: HeaderMap) -> Json<Value> {
@@ -304,6 +307,13 @@ async fn account_link_sequence_configures_and_revokes_the_local_environment() ->
         assert_eq!(input["managedTunnelsEnabled"], false);
         assert!(!input["proof"].as_str().unwrap_or_default().is_empty());
         let mut state = state.lock().await;
+        let link_claims = claims(input["proof"].as_str().unwrap()).unwrap();
+        state.environment_public_key = Some(
+            link_claims["environmentPublicKey"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
         state.linked = true;
         Json(json!({
             "ok":true,
@@ -313,13 +323,45 @@ async fn account_link_sequence_configures_and_revokes_the_local_environment() ->
             "endpointRuntime":null,
             "relayIssuer":"https://relay.fixture.test",
             "environmentCredential":"environment-secret",
-            "cloudMintPublicKey":state.public_key
+            "cloudMintPublicKey":state.relay_public_key
         }))
     }
 
     async fn unlink(State(state): State<Arc<Mutex<RelayState>>>) -> Json<Value> {
         state.lock().await.unlinked = true;
         Json(json!({"ok":true}))
+    }
+
+    async fn preferences(
+        State(state): State<Arc<Mutex<RelayState>>>,
+        Json(input): Json<Value>,
+    ) -> Json<Value> {
+        state.lock().await.hold_webhooks = input["holdWebhooksWhileOffline"] == true;
+        Json(input)
+    }
+
+    async fn activity(
+        State(state): State<Arc<Mutex<RelayState>>>,
+        headers: HeaderMap,
+        Json(input): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer environment-secret"
+        );
+        let mut state = state.lock().await;
+        let activity_claims = t3_connect::verify_relay_proof(
+            state.environment_public_key.as_deref().unwrap(),
+            input["proof"].as_str().unwrap(),
+            t3_connect::ACTIVITY_PUBLISH_TYPE,
+            &format!("t3-env:{}", state.environment_id),
+            "https://relay.fixture.test",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(activity_claims["state"], input["state"]);
+        state.activities.push(input["state"].clone());
+        Json(json!({"ok":true,"deliveries":[]}))
     }
 
     let directory = tempfile::tempdir()?;
@@ -331,9 +373,12 @@ async fn account_link_sequence_configures_and_revokes_the_local_environment() ->
     let relay_identity = EnvironmentIdentity::generate();
     let state = Arc::new(Mutex::new(RelayState {
         environment_id,
-        public_key: relay_identity.public_pem()?,
+        relay_public_key: relay_identity.public_pem()?,
+        environment_public_key: None,
         linked: false,
         unlinked: false,
+        hold_webhooks: false,
+        activities: Vec::new(),
     }));
     let relay = Router::new()
         .route("/v1/client/environment-link-challenges", post(challenge))
@@ -341,6 +386,11 @@ async fn account_link_sequence_configures_and_revokes_the_local_environment() ->
         .route(
             "/v1/client/environment-links/{id}",
             post(link).delete(unlink),
+        )
+        .route("/v1/environments/{id}/link-preferences", post(preferences))
+        .route(
+            "/v1/environments/{environment}/threads/{thread}/agent-activity",
+            post(activity),
         )
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -357,6 +407,40 @@ async fn account_link_sequence_configures_and_revokes_the_local_environment() ->
     assert_eq!(link_state["linked"], true);
     assert_eq!(link_state["cloudUserId"], "cloud-user");
     assert!(state.lock().await.linked);
+
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let thread_id = uuid::Uuid::new_v4().to_string();
+    server
+        .dispatch(json!({
+            "commandId":uuid::Uuid::new_v4().to_string(),
+            "type":"project.create",
+            "projectId":project_id,
+            "workspaceRoot":directory.path(),
+            "title":"Fixture project"
+        }))
+        .await?;
+    server
+        .dispatch(json!({
+            "commandId":uuid::Uuid::new_v4().to_string(),
+            "type":"thread.create",
+            "threadId":thread_id,
+            "projectId":project_id,
+            "title":"Fixture thread",
+            "modelSelection":{"instanceId":"codex","model":"default"}
+        }))
+        .await?;
+    let preferences = server.connect_preferences(true, Some(true)).await?;
+    assert_eq!(preferences["publishAgentActivity"], true);
+    assert_eq!(preferences["holdWebhooksWhileOffline"], true);
+    server
+        .publish_terminal_activity_for_test(&thread_id)
+        .await?;
+    let relay_state = state.lock().await;
+    assert!(relay_state.hold_webhooks);
+    assert_eq!(relay_state.activities.len(), 1);
+    assert_eq!(relay_state.activities[0]["phase"], "completed");
+    assert_eq!(relay_state.activities[0]["projectTitle"], "Fixture project");
+    drop(relay_state);
 
     let unlink_state = server.connect_unlink(Some((&client, &credential))).await?;
     assert_eq!(unlink_state["endpointRuntimeStatus"]["status"], "disabled");

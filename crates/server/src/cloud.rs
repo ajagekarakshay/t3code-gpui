@@ -84,6 +84,18 @@ impl CloudState {
 
 pub(crate) fn issuer(value: &str) -> Result<String> {
     let parsed = url::Url::parse(value.trim())?;
+    #[cfg(feature = "test-support")]
+    if parsed.scheme() == "http"
+        && parsed.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    {
+        return Ok(t3_connect::normalize_issuer(value));
+    }
     ensure!(
         parsed.scheme() == "https"
             && parsed.host_str().is_some()
@@ -180,7 +192,7 @@ impl Services {
             anyhow::bail!("Relay returned a different endpoint provider");
         }
         let configuration = json!({
-            "relayUrl": client.config().relay_issuer(),
+            "relayUrl": client.config().relay_url(),
             "relayIssuer": link.relay_issuer,
             "cloudUserId": link.cloud_user_id,
             "environmentCredential": link.environment_credential,
@@ -260,7 +272,11 @@ impl Services {
         if cloud.status["status"] == "failed" && !cloud.installing {
             return Err(ConnectError::Unavailable(cloud.status.clone()).into());
         }
-        Ok(json!({"ok":true,"endpointRuntimeStatus":cloud.status}))
+        let response = json!({"ok":true,"endpointRuntimeStatus":cloud.status});
+        drop(cloud);
+        self.reset_activity_publications().await;
+        self.queue_activity_catchup().await?;
+        Ok(response)
     }
     pub(crate) async fn link_state(&self) -> Result<Value> {
         let _cloud = self.cloud.lock().await;
@@ -285,9 +301,12 @@ impl Services {
         self.store
             .remove_metadata(&["relayConfig", "relayPreferences", "relayOrigin"])?;
         cloud.stop().await;
-        Ok(json!({"ok":true,"endpointRuntimeStatus":cloud.status}))
+        let response = json!({"ok":true,"endpointRuntimeStatus":cloud.status});
+        drop(cloud);
+        self.reset_activity_publications().await;
+        Ok(response)
     }
-    pub(crate) async fn save_cloud_preferences(&self, input: Value) -> Result<()> {
+    pub(crate) async fn save_cloud_preferences(self: &Arc<Self>, input: Value) -> Result<()> {
         let _serialized = self.cloud.lock().await;
         input["publishAgentActivity"]
             .as_bool()
@@ -312,7 +331,51 @@ impl Services {
         }
         preferences["publishAgentActivity"] = input["publishAgentActivity"].clone();
         self.store
-            .set_metadata("relayPreferences", &preferences.to_string())
+            .set_metadata("relayPreferences", &preferences.to_string())?;
+        self.queue_activity_catchup().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn publish_agent_activity(
+        &self,
+        thread_id: &str,
+        state: Option<Value>,
+    ) -> Result<bool> {
+        let preferences: Value = self
+            .store
+            .metadata("relayPreferences")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .unwrap_or(json!({}));
+        if preferences["publishAgentActivity"] != true {
+            return Ok(false);
+        }
+        let configuration = self.relay_configuration()?;
+        let environment_id = required(&self.descriptor, "environmentId")?;
+        let timestamp = auth::epoch();
+        let proof = self.identity.sign(
+            t3_connect::ACTIVITY_PUBLISH_TYPE,
+            &json!({
+                "iss":format!("t3-env:{environment_id}"),
+                "aud":configuration.issuer()?,
+                "sub":environment_id,
+                "jti":uuid::Uuid::new_v4().to_string(),
+                "iat":timestamp,
+                "exp":timestamp+300,
+                "environmentId":environment_id,
+                "threadId":thread_id,
+                "state":state.clone()
+            }),
+        )?;
+        let encoded_thread =
+            url::form_urlencoded::byte_serialize(thread_id.as_bytes()).collect::<String>();
+        self.relay_request(
+            &configuration,
+            &format!("/v1/environments/{environment_id}/threads/{encoded_thread}/agent-activity"),
+            &json!({"state":state,"proof":proof}),
+        )
+        .await?;
+        Ok(true)
     }
     fn relay_claims(&self, input: &Value, typ: &str, scope: &str) -> Result<(Value, String)> {
         let configuration = self.relay_configuration()?;

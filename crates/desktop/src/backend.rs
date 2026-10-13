@@ -38,6 +38,10 @@ pub(crate) enum Request {
     CancelConnect,
     UnlinkConnect,
     ForgetConnectAccount,
+    SetConnectPreferences {
+        publish: bool,
+        hold: Option<bool>,
+    },
 }
 
 pub(crate) enum Update {
@@ -71,6 +75,10 @@ pub(crate) enum Update {
         code: String,
     },
     SaveConnect(Option<AccountCredential>),
+    ConnectPreferences {
+        publish: bool,
+        hold: bool,
+    },
 }
 
 struct Remote {
@@ -207,11 +215,18 @@ pub(crate) async fn run(
     let (connect_results_tx, connect_results) = async_channel::bounded(1);
     environment_update(None, &updates).await;
     let _ = snapshots(&server, None, None, false, &updates).await;
-    let linked = server
-        .connect_state()
-        .await
-        .ok()
-        .is_some_and(|state| state["linked"] == true);
+    let linked = server.connect_state().await.ok();
+    let _ = updates
+        .send(Update::ConnectPreferences {
+            publish: linked
+                .as_ref()
+                .is_some_and(|state| state["publishAgentActivity"] == true),
+            hold: linked
+                .as_ref()
+                .is_some_and(|state| state["holdWebhooksWhileOffline"] == true),
+        })
+        .await;
+    let linked = linked.is_some_and(|state| state["linked"] == true);
     let _ = updates
         .send(Update::Connect {
             available: connect_client.is_some(),
@@ -239,6 +254,7 @@ pub(crate) async fn run(
                     | Request::CancelConnect
                     | Request::UnlinkConnect
                     | Request::ForgetConnectAccount
+                    | Request::SetConnectPreferences{..}
                 );
                 let result:Result<()>=async {
                     match request {
@@ -300,6 +316,7 @@ pub(crate) async fn run(
                                 identity:connect_credential.as_ref().and_then(|value|value.identity().map(str::to_owned)),
                                 status:"Ready".into(),
                             }).await;
+                            let _=updates.send(Update::ConnectPreferences{publish:state["publishAgentActivity"]==true,hold:state["holdWebhooksWhileOffline"]==true}).await;
                         }
                         Request::StartConnect=>{
                             ensure!(remote.is_none(),"T3 Connect is managed by the local environment");
@@ -312,6 +329,7 @@ pub(crate) async fn run(
                                 }
                                 let state=server.connect_link(client,&credential,server_address, true).await?;
                                 let _=updates.send(Update::Connect{available:true,linked:state["linked"]==true,identity:credential.identity().map(str::to_owned),status:"Connected".into()}).await;
+                                let _=updates.send(Update::ConnectPreferences{publish:state["publishAgentActivity"]==true,hold:state["holdWebhooksWhileOffline"]==true}).await;
                             } else {
                                 if let Some(task)=connect_task.take(){task.abort();let _=task.await;}
                                 let authorization=client.begin_device_authorization().await?;
@@ -341,12 +359,18 @@ pub(crate) async fn run(
                             let account=connect_client.as_ref().zip(connect_credential.as_ref());
                             let state=server.connect_unlink(account).await?;
                             let _=updates.send(Update::Connect{available:connect_client.is_some(),linked:state["linked"]==true,identity:connect_credential.as_ref().and_then(|value|value.identity().map(str::to_owned)),status:"Disconnected".into()}).await;
+                            let _=updates.send(Update::ConnectPreferences{publish:false,hold:false}).await;
                         }
                         Request::ForgetConnectAccount=>{
                             ensure!(server.connect_state().await?["linked"]!=true,"Disconnect T3 Connect before signing out");
                             connect_credential=None;
                             let _=updates.send(Update::SaveConnect(None)).await;
                             let _=updates.send(Update::Connect{available:connect_client.is_some(),linked:false,identity:None,status:"Signed out".into()}).await;
+                        }
+                        Request::SetConnectPreferences{publish,hold}=>{
+                            ensure!(remote.is_none(),"T3 Connect is managed by the local environment");
+                            let state=server.connect_preferences(publish,hold).await?;
+                            let _=updates.send(Update::ConnectPreferences{publish:state["publishAgentActivity"]==true,hold:state["holdWebhooksWhileOffline"]==true}).await;
                         }
                         Request::Select(id)=>{
                             let snapshot=if let Some(remote)=&remote {
@@ -460,6 +484,7 @@ pub(crate) async fn run(
                         match result {
                             Ok(state)=>{
                                 let _=updates.send(Update::Connect{available:true,linked:state["linked"]==true,identity:credential.identity().map(str::to_owned),status:"Connected".into()}).await;
+                                let _=updates.send(Update::ConnectPreferences{publish:state["publishAgentActivity"]==true,hold:state["holdWebhooksWhileOffline"]==true}).await;
                             }
                             Err(error)=>{
                                 let _=updates.send(Update::Connect{available:true,linked:false,identity:credential.identity().map(str::to_owned),status:"Could not link this environment".into()}).await;
