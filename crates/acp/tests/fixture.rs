@@ -16,13 +16,17 @@ fn update(text: &str) {
 }
 fn main() {
     let mut pending = Value::Null;
+    let mut authenticated = std::env::var_os("T3_ACP_FIXTURE_REQUIRE_AUTH").is_none();
     for line in io::stdin().lock().lines() {
         let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let id = &request["id"];
         match request["method"].as_str() {
             Some("initialize") => result(
                 id,
-                json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"fixture","version":"1"},"authMethods":[]}),
+                json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"fixture","version":"1"},"authMethods":[{"id":"fixture-login","name":"Sign in"}]}),
+            ),
+            Some("session/new") if !authenticated => send(
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Authentication required"}}),
             ),
             Some("session/new") => result(id, json!({"sessionId":"native-test"})),
             Some("session/load") => result(id, json!({})),
@@ -48,10 +52,16 @@ fn main() {
                 result(&pending, json!({"stopReason":"cancelled"}));
                 pending = Value::Null;
             }
-            Some("session/set_mode") | Some("session/set_config_option") | Some("authenticate") => {
-                result(id, json!({"configOptions":[]}))
+            Some("authenticate") => {
+                authenticated = true;
+                result(id, json!({}));
             }
-            None if request["id"] == "permission-1" => {
+            Some("session/set_config_option") => result(
+                id,
+                json!({"configOptions":[{"id":request["params"]["configId"],"name":"Agent model","type":"select","currentValue":request["params"]["value"],"options":[{"value":"accurate","name":"Accurate"}]}]}),
+            ),
+            Some("session/set_mode") => result(id, json!({})),
+            None if request["id"] == "permission-1" && !pending.is_null() => {
                 update(
                     request["result"]["outcome"]["optionId"]
                         .as_str()

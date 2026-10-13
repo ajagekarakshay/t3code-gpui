@@ -49,39 +49,26 @@ impl ServerOptions {
 }
 
 pub(crate) struct Services {
+    _home_lock: std::fs::File,
     pub(crate) store: Store,
     pub(crate) agents: BTreeMap<String, AgentCommand>,
     pub(crate) sessions: Mutex<HashMap<String, AgentSession>>,
     pub(crate) changes: broadcast::Sender<Value>,
     pub(crate) effects: Mutex<()>,
     pub(crate) tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    identity: EnvironmentIdentity,
-    descriptor: Value,
+    pub(crate) identity: EnvironmentIdentity,
+    pub(crate) descriptor: Value,
+    pub(crate) cloud: Mutex<crate::cloud::CloudState>,
 }
 
 #[derive(Clone)]
 pub struct Server {
-    services: Arc<Services>,
+    pub(crate) services: Arc<Services>,
 }
 impl Server {
     pub fn open(options: ServerOptions) -> Result<Self> {
-        std::fs::create_dir_all(&options.home)?;
-        let home = std::fs::canonicalize(&options.home)?;
-        if let Some(user_home) =
-            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-        {
-            let live = PathBuf::from(user_home).join(".t3");
-            let live = std::fs::canonicalize(&live).unwrap_or(live);
-            ensure!(
-                !home.starts_with(&live),
-                "The Rust migration must use a separate data directory from ~/.t3"
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
-        }
+        let home = crate::home::prepare(&options.home)?;
+        let home_lock = crate::home::lock(&home)?;
         let store = Store::open(&home.join("rust-state.sqlite"))?;
         let id = if let Some(id) = store.metadata("environmentId")? {
             id
@@ -113,6 +100,7 @@ impl Server {
         let (changes, _) = broadcast::channel(256);
         Ok(Self {
             services: Arc::new(Services {
+                _home_lock: home_lock,
                 store,
                 agents: options.agents,
                 sessions: Mutex::default(),
@@ -121,6 +109,7 @@ impl Server {
                 tasks: Mutex::default(),
                 identity,
                 descriptor,
+                cloud: Mutex::new(crate::cloud::CloudState::new(home)),
             }),
         })
     }
@@ -139,6 +128,9 @@ impl Server {
             .route("/api/rust/dispatch", post(dispatch))
             .route("/api/connect/link-proof", post(link_proof))
             .route("/api/connect/relay-config", post(relay_configuration))
+            .route("/api/connect/link-state", get(link_state))
+            .route("/api/connect/unlink", post(unlink))
+            .route("/api/connect/preferences", post(cloud_preferences))
             .route("/api/t3-connect/health", post(relay_health))
             .route("/api/connect/mint-credential", post(relay_mint))
             .route("/api/t3-connect/mint-credential", post(relay_mint))
@@ -170,6 +162,12 @@ impl Server {
     pub async fn dispatch(&self, command: Value) -> Result<Value> {
         self.services.dispatch(command).await
     }
+    pub async fn configure_agent(&self, thread_id: &str, id: String, value: Value) -> Result<()> {
+        self.services.configure_agent(thread_id, id, value).await
+    }
+    pub async fn authenticate_agent(&self, thread_id: &str, method: String) -> Result<()> {
+        self.services.authenticate_agent(thread_id, method).await
+    }
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.services.changes.subscribe()
     }
@@ -184,7 +182,11 @@ impl Server {
     ) -> Result<()> {
         self.services.answer_permission(thread, id, option).await
     }
+    pub async fn start_connect(&self, address: std::net::SocketAddr) -> Result<()> {
+        self.services.start_connect(address).await
+    }
     pub async fn shutdown(&self) {
+        self.services.cloud.lock().await.stop().await;
         for session in self.services.sessions.lock().await.values() {
             let _ = session.send(SessionCommand::Shutdown).await;
         }
@@ -328,20 +330,6 @@ fn reject_forwarded(headers: &HeaderMap) -> Result<()> {
     }
     Ok(())
 }
-fn issuer(value: &str) -> Result<String> {
-    let parsed = url::Url::parse(value)?;
-    ensure!(
-        parsed.scheme() == "https"
-            && parsed.host_str().is_some()
-            && parsed.username().is_empty()
-            && parsed.password().is_none()
-            && parsed.query().is_none()
-            && parsed.fragment().is_none(),
-        "Relay issuer must use HTTPS"
-    );
-    Ok(t3_connect::normalize_issuer(value))
-}
-
 async fn link_proof(
     State(s): State<Arc<Services>>,
     h: HeaderMap,
@@ -350,28 +338,8 @@ async fn link_proof(
 ) -> ApiResult {
     authenticate(&s, &h, &u, "POST", Some("relay:write"))?;
     reject_forwarded(&h)?;
-    let relay = issuer(required(&input, "relayIssuer")?)?;
-    let origin = &input["origin"];
-    let port = origin["localHttpPort"]
-        .as_u64()
-        .filter(|v| *v <= 65535)
-        .context("Invalid tunnel port")? as u16;
-    t3_connect::TunnelConfiguration::validate_origin(required(origin, "localHttpHost")?, port)?;
-    let host = h
-        .get("host")
-        .context("Missing host")?
-        .to_str()
-        .map_err(anyhow::Error::from)?;
-    let request = url::Url::parse(&format!("http://{host}")).map_err(anyhow::Error::from)?;
-    if request.port_or_known_default() != Some(port) {
-        return Err(anyhow::anyhow!("Tunnel port must match this environment").into());
-    }
-    let timestamp = auth::epoch();
-    let id = required(&s.descriptor, "environmentId")?;
-    let proof=s.identity.sign(t3_connect::LINK_PROOF_TYPE,&json!({"iss":format!("t3-env:{id}"),"aud":relay,"sub":id,"jti":uuid::Uuid::new_v4().to_string(),"iat":timestamp,"exp":timestamp+300,"challenge":required(&input,"challenge")?,"descriptor":s.descriptor,"environmentId":id,"environmentPublicKey":s.identity.public_pem()?,"endpoint":input["endpoint"],"origin":origin,"scopes":["agent_activity_notifications","managed_tunnels"]}))?;
-    Ok(Json(json!(proof)))
+    Ok(Json(json!(s.link_proof(&input, &request_url(&h, &u)?)?)))
 }
-
 async fn relay_configuration(
     State(s): State<Arc<Services>>,
     h: HeaderMap,
@@ -380,56 +348,25 @@ async fn relay_configuration(
 ) -> ApiResult {
     authenticate(&s, &h, &u, "POST", Some("relay:write"))?;
     reject_forwarded(&h)?;
-    issuer(required(&input, "relayUrl")?)?;
-    issuer(
-        input["relayIssuer"]
-            .as_str()
-            .unwrap_or(required(&input, "relayUrl")?),
-    )?;
-    required(&input, "cloudUserId")?;
-    required(&input, "cloudMintPublicKey")?;
-    required(&input, "environmentCredential")?;
-    if !input["endpointRuntime"].is_null() {
-        let _: t3_connect::TunnelConfiguration =
-            serde_json::from_value(input["endpointRuntime"].clone())
-                .map_err(anyhow::Error::from)?;
-    }
-    s.store.set_metadata("relayConfig", &input.to_string())?;
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(s.configure_relay(input).await?))
 }
-
-fn relay_claims(
-    s: &Services,
-    input: &Value,
-    typ: &str,
-    scope: &str,
-) -> Result<(Value, Value, String)> {
-    let configuration: Value = serde_json::from_str(
-        &s.store
-            .metadata("relayConfig")?
-            .context("Environment is not linked")?,
-    )?;
-    let relay = issuer(
-        configuration["relayIssuer"]
-            .as_str()
-            .unwrap_or(required(&configuration, "relayUrl")?),
-    )?;
-    let id = required(&s.descriptor, "environmentId")?;
-    let claims = t3_connect::verify_relay_proof(
-        required(&configuration, "cloudMintPublicKey")?,
-        required(input, "proof")?,
-        typ,
-        &relay,
-        &format!("t3-env:{id}"),
-        auth::epoch(),
-    )?;
-    ensure!(
-        claims["environmentId"] == id
-            && claims["sub"] == configuration["cloudUserId"]
-            && claims["scope"] == json!([scope]),
-        "Relay authority mismatch"
-    );
-    Ok((claims, configuration, relay))
+async fn link_state(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
+    authenticate(&s, &h, &u, "GET", Some("relay:read"))?;
+    Ok(Json(s.link_state().await?))
+}
+async fn unlink(State(s): State<Arc<Services>>, h: HeaderMap, u: Uri) -> ApiResult {
+    authenticate(&s, &h, &u, "POST", Some("relay:write"))?;
+    Ok(Json(s.unlink().await?))
+}
+async fn cloud_preferences(
+    State(s): State<Arc<Services>>,
+    h: HeaderMap,
+    u: Uri,
+    Json(input): Json<Value>,
+) -> ApiResult {
+    authenticate(&s, &h, &u, "POST", Some("relay:write"))?;
+    s.save_cloud_preferences(input).await?;
+    Ok(Json(Value::Null))
 }
 async fn relay_health(
     State(s): State<Arc<Services>>,
@@ -437,20 +374,7 @@ async fn relay_health(
     Json(input): Json<Value>,
 ) -> ApiResult {
     reject_forwarded(&h)?;
-    let (claims, _, relay) = relay_claims(
-        &s,
-        &input,
-        t3_connect::HEALTH_REQUEST_TYPE,
-        "environment:status",
-    )?;
-    s.store.consume_relay_proof("health", &claims)?;
-    let timestamp = auth::epoch();
-    let id = required(&s.descriptor, "environmentId")?;
-    let checked = auth::iso(timestamp);
-    let proof=s.identity.sign(t3_connect::HEALTH_RESPONSE_TYPE,&json!({"iss":format!("t3-env:{id}"),"aud":relay,"sub":id,"jti":uuid::Uuid::new_v4().to_string(),"iat":timestamp,"exp":timestamp+300,"environmentId":id,"requestNonce":claims["nonce"],"status":"online","descriptor":s.descriptor,"checkedAt":checked}))?;
-    Ok(Json(
-        json!({"environmentId":id,"status":"online","descriptor":s.descriptor,"checkedAt":checked,"proof":proof}),
-    ))
+    Ok(Json(s.relay_health(&input).await?))
 }
 async fn relay_mint(
     State(s): State<Arc<Services>>,
@@ -458,28 +382,7 @@ async fn relay_mint(
     Json(input): Json<Value>,
 ) -> ApiResult {
     reject_forwarded(&h)?;
-    let (claims, _, relay) = relay_claims(
-        &s,
-        &input,
-        t3_connect::MINT_REQUEST_TYPE,
-        "environment:connect",
-    )?;
-    let thumbprint = required(&claims, "clientProofKeyThumbprint")?;
-    if claims["cnf"]["jkt"] != thumbprint {
-        return Err(anyhow::anyhow!("Client proof key mismatch").into());
-    }
-    s.store.consume_relay_proof("mint", &claims)?;
-    let scopes = auth::STANDARD_SCOPES
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    let grant = s.store.grant(&scopes, Some(thumbprint), 120, false)?;
-    let timestamp = auth::epoch();
-    let id = required(&s.descriptor, "environmentId")?;
-    let proof=s.identity.sign(t3_connect::MINT_RESPONSE_TYPE,&json!({"iss":format!("t3-env:{id}"),"aud":relay,"sub":id,"jti":uuid::Uuid::new_v4().to_string(),"iat":timestamp,"exp":timestamp+120,"environmentId":id,"requestNonce":claims["nonce"],"clientProofKeyThumbprint":thumbprint,"credential":grant["credential"]}))?;
-    Ok(Json(
-        json!({"credential":grant["credential"],"expiresAt":grant["expiresAt"],"proof":proof}),
-    ))
+    Ok(Json(s.relay_mint(&input).await?))
 }
 
 async fn websocket(
@@ -501,37 +404,107 @@ async fn websocket(
         .on_upgrade(move |socket| serve_socket(s, session, socket)))
 }
 
+struct RpcSubscription {
+    id: Value,
+    tag: String,
+    input: Value,
+    awaiting_ack: bool,
+    dirty: bool,
+}
+fn request_key(id: &Value) -> Option<String> {
+    (id.is_string() || id.as_u64().is_some()).then(|| id.to_string())
+}
+fn rpc_failure(id: &Value, error: &anyhow::Error) -> Value {
+    // Effect's CauseEncoded is an array. A defect is decodable without a provider-specific error schema.
+    json!({"_tag":"Exit","requestId":id,"exit":{"_tag":"Failure","cause":[{"_tag":"Die","defect":{"message":error.to_string()}}]}})
+}
+async fn send_rpc(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    response: Value,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sender.send(Message::Text(response.to_string().into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+async fn flush_subscription(
+    s: &Arc<Services>,
+    session: &Session,
+    subscription: &mut RpcSubscription,
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+) -> bool {
+    if subscription.awaiting_ack || !subscription.dirty {
+        return true;
+    }
+    let response = match rpc(s, session, &subscription.tag, &subscription.input).await {
+        Ok(value) => json!({"_tag":"Chunk","requestId":subscription.id,"values":[value]}),
+        Err(error) => {
+            let _ = send_rpc(sender, rpc_failure(&subscription.id, &error)).await;
+            return false;
+        }
+    };
+    subscription.awaiting_ack = true;
+    subscription.dirty = false;
+    send_rpc(sender, response).await
+}
 async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
     let mut changes = s.changes.subscribe();
-    let mut subscriptions = HashMap::<String, (String, Value)>::new();
+    let mut subscriptions = HashMap::<String, RpcSubscription>::new();
     loop {
         tokio::select! {
             received=receiver.next()=>{
-                let Some(Ok(Message::Text(text)))=received else{break};
-                for line in text.lines(){
-                    let Ok(request)=serde_json::from_str::<Value>(line) else{continue};
-                    if request["_tag"]=="Ping"{let _=sender.send(Message::Text(json!({"_tag":"Pong"}).to_string().into())).await;continue;}
-                    let id=request["id"].as_str().unwrap_or_default().to_owned();
-                    if request["_tag"]=="Interrupt"{if let Some(id)=request["requestId"].as_str(){subscriptions.remove(id);}continue;}
-                    if request["_tag"]!="Request"{continue;}
-                    if !s.store.session_valid(session.id()).unwrap_or(false){return;}
+                let text=match received { Some(Ok(Message::Text(text)))=>text, Some(Ok(Message::Ping(_) | Message::Pong(_)))=>continue, _=>break };
+                let parsed=serde_json::from_str::<Value>(&text);
+                let requests=match parsed {
+                    Ok(Value::Array(batch))=>batch,
+                    Ok(value)=>vec![value],
+                    Err(_)=>text.lines().filter_map(|line|serde_json::from_str(line).ok()).collect(),
+                };
+                if !s.store.session_valid(session.id()).unwrap_or(false){return;}
+                for request in requests {
+                    match request["_tag"].as_str() {
+                        Some("Ping")=>{if !send_rpc(&mut sender,json!({"_tag":"Pong"})).await{return;}continue;},
+                        Some("Interrupt")=>{if let Some(key)=request_key(&request["requestId"]){subscriptions.remove(&key);}continue;},
+                        Some("Ack")=>{
+                            if let Some(key)=request_key(&request["requestId"])
+                                && let Some(subscription)=subscriptions.get_mut(&key){
+                                    subscription.awaiting_ack=false;
+                                    if !flush_subscription(&s,&session,subscription,&mut sender).await{return;}
+                                }
+                            continue;
+                        },
+                        Some("Request")=>{},
+                        _=>continue,
+                    }
+                    let id=&request["id"];
+                    let Some(key)=request_key(id)else{continue};
                     let tag=request["tag"].as_str().unwrap_or_default();let input=&request["payload"];
                     let streaming=matches!(tag,"orchestration.subscribeShell"|"rust.subscribeThread");
-                    let result=rpc(&s,&session,tag,input).await;
-                    let response=match result{
-                        Ok(value) if streaming=>{subscriptions.insert(id.clone(),(tag.into(),input.clone()));json!({"_tag":"Chunk","requestId":id,"values":[value]})},
+                    let response=match rpc(&s,&session,tag,input).await {
+                        Ok(value) if streaming=>{
+                            subscriptions.insert(key,RpcSubscription{id:id.clone(),tag:tag.into(),input:input.clone(),awaiting_ack:true,dirty:false});
+                            json!({"_tag":"Chunk","requestId":id,"values":[value]})
+                        },
                         Ok(value)=>json!({"_tag":"Exit","requestId":id,"exit":{"_tag":"Success","value":value}}),
-                        Err(error)=>json!({"_tag":"Exit","requestId":id,"exit":{"_tag":"Failure","cause":{"_tag":"Fail","error":{"_tag":"RustMigrationError","message":error.to_string()}}}}),
+                        Err(error)=>rpc_failure(id,&error),
                     };
-                    if sender.send(Message::Text(response.to_string().into())).await.is_err(){return;}
+                    if !send_rpc(&mut sender,response).await{return;}
                 }
             }
             change=changes.recv()=>{
-                if change.is_err(){break;}
+                let Ok(change)=change else{break};
                 if !s.store.session_valid(session.id()).unwrap_or(false){break;}
-                for(id,(tag,input))in &subscriptions{
-                    if let Ok(value)=rpc(&s,&session,tag,input).await{if sender.send(Message::Text(json!({"_tag":"Chunk","requestId":id,"values":[value]}).to_string().into())).await.is_err(){return;}}
+                for subscription in subscriptions.values_mut(){
+                    let relevant=subscription.tag=="orchestration.subscribeShell" || change["threadId"].is_null() || change["threadId"]==subscription.input["threadId"];
+                    if relevant {
+                        subscription.dirty=true;
+                        if !flush_subscription(&s,&session,subscription,&mut sender).await{return;}
+                    }
                 }
             }
         }
@@ -539,6 +512,7 @@ async fn serve_socket(s: Arc<Services>, session: Session, socket: WebSocket) {
 }
 async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> Result<Value> {
     let scope = match tag {
+        "rust.configureAgent" | "rust.authenticateAgent" => "providers:manage",
         "orchestration.dispatchCommand"
         | "projects.mutate"
         | "rust.cancel"
@@ -558,6 +532,23 @@ async fn rpc(s: &Arc<Services>, session: &Session, tag: &str, input: &Value) -> 
         "rust.getThread" | "rust.subscribeThread" => s.store.thread(required(input, "threadId")?),
         "rust.cancel" => {
             s.cancel(required(input, "threadId")?).await?;
+            Ok(Value::Null)
+        }
+        "rust.configureAgent" => {
+            s.configure_agent(
+                required(input, "threadId")?,
+                required(input, "id")?.into(),
+                input["value"].clone(),
+            )
+            .await?;
+            Ok(Value::Null)
+        }
+        "rust.authenticateAgent" => {
+            s.authenticate_agent(
+                required(input, "threadId")?,
+                required(input, "method")?.into(),
+            )
+            .await?;
             Ok(Value::Null)
         }
         "rust.answerPermission" => {

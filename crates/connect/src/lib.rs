@@ -4,8 +4,8 @@ mod dpop;
 mod identity;
 mod tunnel;
 pub use dpop::{DpopKey, DpopProof, verify_dpop};
-pub use identity::{EnvironmentIdentity, verify_relay_proof};
-pub use tunnel::{Tunnel, TunnelConfiguration};
+pub use identity::{EnvironmentIdentity, validate_relay_key, verify_relay_proof};
+pub use tunnel::{Tunnel, TunnelConfiguration, TunnelState};
 
 pub const LINK_PROOF_TYPE: &str = "t3-env-link+jwt";
 pub const MINT_REQUEST_TYPE: &str = "t3-cloud-mint+jwt";

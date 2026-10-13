@@ -5,6 +5,7 @@ use gpui_kit::component::{
     command::{Command, CommandItem, CommandState},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     sidebar::{SidebarFooter, SidebarHeader},
     text::TextView,
 };
@@ -50,10 +51,32 @@ struct Row {
     title: SharedString,
     project: bool,
 }
+#[derive(Clone)]
 struct ChatMessage {
     id: SharedString,
     role: SharedString,
     text: SharedString,
+    tool: Option<Value>,
+    tool_text: SharedString,
+}
+#[derive(Clone)]
+struct AgentChoice {
+    value: Value,
+    label: SharedString,
+}
+impl SelectItem for AgentChoice {
+    type Value = Value;
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+    fn value(&self) -> &Value {
+        &self.value
+    }
+}
+struct AgentControl {
+    label: SharedString,
+    state: Entity<SelectState<SearchableVec<AgentChoice>>>,
+    _subscription: Subscription,
 }
 enum Page {
     Conversation,
@@ -81,6 +104,7 @@ pub(crate) struct Workspace {
     provider: String,
     drafts: HashMap<String, String>,
     permissions: HashMap<String, Value>,
+    agent_controls: Vec<AgentControl>,
     page: Page,
     busy: bool,
     error: Option<SharedString>,
@@ -145,6 +169,7 @@ impl Workspace {
             provider: "claude-code".into(),
             drafts: HashMap::new(),
             permissions: HashMap::new(),
+            agent_controls: Vec::new(),
             page: Page::Conversation,
             busy: false,
             error: None,
@@ -208,10 +233,16 @@ impl Workspace {
                     let draft = self.drafts.get(&id).cloned().unwrap_or_default();
                     self.composer
                         .update(cx, |state, cx| state.set_value(draft, window, cx));
-                    self.selected_thread = Some(id);
+                    self.selected_thread = Some(id.clone());
                     self.selected_project =
                         snapshot["thread"]["projectId"].as_str().map(str::to_owned);
                     self.page = Page::Conversation;
+                }
+                if let Some(permission) = snapshot["thread"]
+                    .get("pendingAcpPermission")
+                    .filter(|value| !value.is_null())
+                {
+                    self.permissions.insert(id.clone(), permission.clone());
                 }
                 let messages = snapshot["messages"]
                     .as_array()
@@ -229,12 +260,15 @@ impl Workspace {
                             .unwrap_or_default()
                             .to_owned()
                             .into(),
+                        tool: message.get("toolCall").cloned(),
+                        tool_text: message.get("toolCall").map(tool_output).unwrap_or_default(),
                     })
                     .collect::<Vec<_>>();
                 let old_count = self.messages.len();
                 let count = messages.len();
                 self.messages = Rc::new(messages);
                 self.detail = snapshot;
+                self.refresh_agent_controls(window, cx);
                 self.scroller.update(cx, |state, cx| {
                     if reset || count < old_count {
                         state.reset(count, cx);
@@ -247,23 +281,24 @@ impl Workspace {
                 if matches!(
                     self.detail["thread"]["status"].as_str(),
                     Some("idle" | "error")
-                ) {
-                    if let Some(id) = &self.selected_thread {
-                        self.permissions.remove(id);
-                    }
+                ) && let Some(id) = &self.selected_thread
+                {
+                    self.permissions.remove(id);
                 }
             }
-            Update::Permission { thread, event } => {
-                self.permissions.insert(thread, event);
-            }
-            Update::Completed { clear_draft } => {
+            Update::Agent(change) => self.receive_agent(change, window, cx),
+            Update::Completed { submitted } => {
                 self.busy = false;
                 self.error = None;
-                if clear_draft {
-                    self.composer
-                        .update(cx, |state, cx| state.set_value("", window, cx));
-                    if let Some(id) = &self.selected_thread {
-                        self.drafts.remove(id);
+                if let Some((id, text)) = submitted {
+                    if self.selected_thread.as_deref() == Some(&id)
+                        && self.composer.read(cx).value().as_ref() == text
+                    {
+                        self.composer
+                            .update(cx, |state, cx| state.set_value("", window, cx));
+                    }
+                    if self.drafts.get(&id).is_some_and(|draft| *draft == text) {
+                        self.drafts.remove(&id);
                     }
                 }
                 if matches!(self.page, Page::Project) {
@@ -276,6 +311,185 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn receive_agent(&mut self, change: Value, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = change["threadId"].as_str() else {
+            return;
+        };
+        if change["sequence"].as_u64() > self.shell["snapshotSequence"].as_u64()
+            && let Some(threads) = self.shell["threads"].as_array_mut()
+            && let Some(thread) = threads.iter_mut().find(|thread| thread["id"] == thread_id)
+        {
+            *thread = change["thread"].clone();
+        }
+        if self.selected_thread.as_deref() != Some(thread_id) {
+            return;
+        }
+        if change["sequence"].as_u64() <= self.detail["snapshotSequence"].as_u64() {
+            return;
+        }
+        self.detail["thread"] = change["thread"].clone();
+        self.detail["snapshotSequence"] = change["sequence"].clone();
+        let event = &change["agentEvent"];
+        if event["type"] == "acp.permission" {
+            self.permissions.insert(thread_id.to_owned(), event.clone());
+        }
+        if matches!(
+            event["type"].as_str(),
+            Some("acp.turn.finished" | "acp.failure" | "acp.permission.answered")
+        ) {
+            self.permissions.remove(thread_id);
+        }
+        let update = &event["data"]["update"];
+        let run = change["thread"]["latestRunId"].as_str().unwrap_or_default();
+        let old_count = self.messages.len();
+        let messages = Rc::make_mut(&mut self.messages);
+        match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                let id = format!("assistant:{run}");
+                let text = update["content"]["text"].as_str().unwrap_or_default();
+                if let Some(message) = messages
+                    .iter_mut()
+                    .find(|message| message.id.as_ref() == id)
+                {
+                    message.text = format!("{}{text}", message.text).into();
+                } else {
+                    messages.push(ChatMessage {
+                        id: id.into(),
+                        role: "assistant".into(),
+                        text: text.to_owned().into(),
+                        tool: None,
+                        tool_text: SharedString::default(),
+                    });
+                }
+            }
+            Some("tool_call" | "tool_call_update") => {
+                let id = format!(
+                    "tool:{run}:{}",
+                    update["toolCallId"].as_str().unwrap_or_default()
+                );
+                let index = messages
+                    .iter()
+                    .position(|message| message.id.as_ref() == id)
+                    .unwrap_or_else(|| {
+                        messages.push(ChatMessage {
+                            id: id.into(),
+                            role: "tool".into(),
+                            text: "".into(),
+                            tool: Some(json!({})),
+                            tool_text: SharedString::default(),
+                        });
+                        messages.len() - 1
+                    });
+                let message = &mut messages[index];
+                if let Some(fields) = update.as_object() {
+                    for (key, value) in fields {
+                        message.tool.as_mut().unwrap()[key] = value.clone();
+                    }
+                }
+                message.tool_text = tool_output(message.tool.as_ref().unwrap());
+                message.text = message.tool.as_ref().unwrap()["title"]
+                    .as_str()
+                    .unwrap_or("Tool call")
+                    .to_owned()
+                    .into();
+            }
+            _ => {}
+        }
+        let count = messages.len();
+        self.scroller.update(cx, |state, cx| {
+            if count > old_count {
+                state.append(count - old_count, cx);
+            } else if count > 0 {
+                state.remeasure_items(count - 1..count, cx);
+            }
+        });
+        if matches!(
+            event["type"].as_str(),
+            Some("acp.ready" | "acp.configuration")
+        ) || matches!(
+            update["sessionUpdate"].as_str(),
+            Some("config_option_update" | "current_mode_update")
+        ) {
+            self.refresh_agent_controls(window, cx);
+        }
+    }
+    fn refresh_agent_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_controls.clear();
+        let Some(thread) = self.selected_thread.clone() else {
+            return;
+        };
+        if let Some(options) =
+            self.detail["thread"]["agentConfiguration"]["session"]["configOptions"].as_array()
+        {
+            for option in options {
+                let Some(id) = option["id"].as_str() else {
+                    continue;
+                };
+                let mut choices = Vec::new();
+                if option["type"] == "boolean" {
+                    choices.push(AgentChoice {
+                        value: json!(true),
+                        label: "On".into(),
+                    });
+                    choices.push(AgentChoice {
+                        value: json!(false),
+                        label: "Off".into(),
+                    });
+                } else if let Some(values) = option["options"].as_array() {
+                    for value in values {
+                        let entries = value["options"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_else(|| vec![value.clone()]);
+                        for entry in entries {
+                            if entry["value"].is_string() {
+                                choices.push(AgentChoice {
+                                    value: entry["value"].clone(),
+                                    label: entry["name"]
+                                        .as_str()
+                                        .unwrap_or("Option")
+                                        .to_owned()
+                                        .into(),
+                                });
+                            }
+                        }
+                    }
+                }
+                let selected = choices
+                    .iter()
+                    .position(|choice| choice.value == option["currentValue"])
+                    .map(|row| gpui_kit::component::IndexPath::default().row(row));
+                let state = cx.new(|cx| {
+                    SelectState::new(SearchableVec::from(choices), selected, window, cx)
+                        .searchable(true)
+                });
+                let id = id.to_owned();
+                let thread = thread.clone();
+                let subscription = cx.subscribe(&state, move |this, _, event, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        this.request(
+                            Request::Configure {
+                                thread: thread.clone(),
+                                id: id.clone(),
+                                value: value.clone(),
+                            },
+                            cx,
+                        );
+                    }
+                });
+                self.agent_controls.push(AgentControl {
+                    label: option["name"]
+                        .as_str()
+                        .unwrap_or("Agent setting")
+                        .to_owned()
+                        .into(),
+                    state,
+                    _subscription: subscription,
+                });
+            }
+        }
     }
 
     fn request(&mut self, request: Request, cx: &mut Context<Self>) {
@@ -365,25 +579,31 @@ impl Workspace {
     }
     fn commands(&mut self, _: &ShowCommands, window: &mut Window, cx: &mut Context<Self>) {
         let palette = self.palette.clone();
+        let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
+            let workspace = workspace.clone();
             dialog.title("Commands").child(
-                Command::new(&palette).items([
-                    CommandItem::new()
-                        .label("New thread")
-                        .action(Box::new(NewThread)),
-                    CommandItem::new()
-                        .label("Add project…")
-                        .action(Box::new(AddProject)),
-                    CommandItem::new()
-                        .label("Settings…")
-                        .action(Box::new(ShowSettings)),
-                    CommandItem::new()
-                        .label("Stop turn")
-                        .action(Box::new(StopTurn)),
-                ]),
+                Command::new(&palette)
+                    .items([
+                        CommandItem::new().label("New thread"),
+                        CommandItem::new().label("Add project…"),
+                        CommandItem::new().label("Settings…"),
+                        CommandItem::new().label("Stop turn"),
+                    ])
+                    .on_confirm(move |index, window, cx| {
+                        window.close_dialog(cx);
+                        let _ = workspace.update(cx, |this, cx| match index.row {
+                            0 => this.new_thread(&NewThread, window, cx),
+                            1 => this.add_project(&AddProject, window, cx),
+                            2 => this.settings(&ShowSettings, window, cx),
+                            3 => this.stop_turn(&StopTurn, window, cx),
+                            _ => {}
+                        });
+                    }),
             )
         });
     }
+
     fn is_running(&self) -> bool {
         matches!(
             self.detail["thread"]["status"].as_str(),
@@ -500,6 +720,17 @@ impl Workspace {
                             .text_color(cx.theme().muted_foreground)
                             .child(message.role.clone()),
                     )
+                    .when_some(message.tool.as_ref(), |this, tool| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .child(tool["status"].as_str().unwrap_or("pending").to_owned()),
+                        )
+                        .child(TextView::markdown(
+                            (ElementId::from("tool-output"), message.id.clone()),
+                            message.tool_text.clone(),
+                        ))
+                    })
                     .child(TextView::markdown(
                         (ElementId::from("message-content"), message.id.clone()),
                         message.text.clone(),
@@ -509,48 +740,77 @@ impl Workspace {
             .flex_1()
             .min_h_0(),
         );
-        if let Some(thread) = &self.selected_thread {
-            if let Some(permission) = self.permissions.get(thread) {
-                let request_id = permission["id"].as_str().unwrap_or_default().to_owned();
-                let mut panel = div()
-                    .p_4()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        permission["request"]["toolCall"]["title"]
-                            .as_str()
-                            .unwrap_or("Permission requested")
-                            .to_owned(),
-                    );
-                if let Some(options) = permission["request"]["options"].as_array() {
-                    for option in options {
-                        let thread = thread.clone();
-                        let id = request_id.clone();
-                        let option_id = option["optionId"].as_str().unwrap_or_default().to_owned();
-                        panel = panel.child(
-                            Button::new((
-                                ElementId::from("permission"),
-                                SharedString::from(option_id.clone()),
-                            ))
-                            .label(option["name"].as_str().unwrap_or("Choose").to_owned())
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.permissions.remove(&thread);
-                                    this.request(
-                                        Request::Permission {
-                                            thread: thread.clone(),
-                                            id: id.clone(),
-                                            option: Some(option_id.clone()),
-                                        },
-                                        cx,
-                                    );
-                                },
-                            )),
+        if let Some(methods) = self.detail["thread"]["authenticationMethods"].as_array() {
+            let mut panel = div()
+                .p_4()
+                .gap_2()
+                .flex()
+                .flex_col()
+                .child("Sign in to continue");
+            for method in methods.iter().filter(|method| method["type"] != "terminal") {
+                let Some(thread) = self.selected_thread.clone() else {
+                    continue;
+                };
+                let id = method["id"].as_str().unwrap_or_default().to_owned();
+                panel = panel.child(
+                    Button::new((
+                        ElementId::from("agent-auth"),
+                        SharedString::from(id.clone()),
+                    ))
+                    .label(method["name"].as_str().unwrap_or("Sign in").to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request(
+                            Request::Authenticate {
+                                thread: thread.clone(),
+                                method: id.clone(),
+                            },
+                            cx,
                         )
-                    }
-                }
-                content = content.child(panel);
+                    })),
+                );
             }
+            content = content.child(panel);
+        }
+        if let Some(thread) = &self.selected_thread
+            && let Some(permission) = self.permissions.get(thread)
+        {
+            let request_id = permission["id"].as_str().unwrap_or_default().to_owned();
+            let mut panel = div()
+                .p_4()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(
+                    permission["request"]["toolCall"]["title"]
+                        .as_str()
+                        .unwrap_or("Permission requested")
+                        .to_owned(),
+                );
+            if let Some(options) = permission["request"]["options"].as_array() {
+                for option in options {
+                    let thread = thread.clone();
+                    let id = request_id.clone();
+                    let option_id = option["optionId"].as_str().unwrap_or_default().to_owned();
+                    panel = panel.child(
+                        Button::new((
+                            ElementId::from("permission"),
+                            SharedString::from(option_id.clone()),
+                        ))
+                        .label(option["name"].as_str().unwrap_or("Choose").to_owned())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.permissions.remove(&thread);
+                            this.request(
+                                Request::Permission {
+                                    thread: thread.clone(),
+                                    id: id.clone(),
+                                    option: Some(option_id.clone()),
+                                },
+                                cx,
+                            );
+                        })),
+                    )
+                }
+            }
+            content = content.child(panel);
         }
         content
             .child(
@@ -595,6 +855,41 @@ impl Workspace {
     }
 }
 
+fn tool_output(tool: &Value) -> SharedString {
+    let mut parts = Vec::new();
+    if let Some(content) = tool["content"].as_array() {
+        for item in content {
+            if let Some(text) = item["content"]["text"].as_str() {
+                parts.push(text.to_owned());
+            }
+            if item["type"] == "diff" {
+                parts.push(format!(
+                    "{}\n```diff\n- {}\n+ {}\n```",
+                    item["path"].as_str().unwrap_or("File change"),
+                    item["oldText"].as_str().unwrap_or_default(),
+                    item["newText"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+    }
+    if parts.is_empty()
+        && let Some(output) = tool.get("rawOutput")
+    {
+        parts.push(
+            output
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| output.to_string()),
+        );
+    }
+    parts
+        .join("\n\n")
+        .chars()
+        .take(24000)
+        .collect::<String>()
+        .into()
+}
+
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let page = match self.page {
@@ -637,6 +932,14 @@ impl Render for Workspace {
                             }),
                     ),
                 )
+                .children(self.agent_controls.iter().map(|control| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(control.label.clone())
+                        .child(Select::new(&control.state).disabled(self.is_running()))
+                }))
                 .child(format!("Local environment: http://{}", self.address))
                 .child("Agents use their own installed credentials and configuration.")
                 .into_any_element(),

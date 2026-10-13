@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
     let server = Server::open(ServerOptions::new(arguments.home_dir))?;
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
+    server.start_connect(listener.local_addr()?).await?;
     eprintln!(
         "T3 Rust server listening at http://{}",
         listener.local_addr()?

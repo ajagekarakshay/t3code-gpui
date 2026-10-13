@@ -1,7 +1,4 @@
-use crate::{
-    http::Services,
-    store::{now, required},
-};
+use crate::{http::Services, store::required};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -10,14 +7,14 @@ use t3_acp::{AgentEvent, Session, SessionCommand};
 impl Services {
     pub(crate) async fn dispatch(self: &Arc<Self>, mut command: Value) -> Result<Value> {
         let kind = required(&command, "type")?.to_owned();
-        if matches!(kind.as_str(), "project.create" | "project.update") {
-            if let Some(root) = command["workspaceRoot"].as_str() {
-                let root = tokio::fs::canonicalize(root)
-                    .await
-                    .context("Project directory does not exist")?;
-                ensure!(root.is_dir(), "Project root must be a directory");
-                command["workspaceRoot"] = json!(root);
-            }
+        if matches!(kind.as_str(), "project.create" | "project.update")
+            && let Some(root) = command["workspaceRoot"].as_str()
+        {
+            let root = tokio::fs::canonicalize(root)
+                .await
+                .context("Project directory does not exist")?;
+            ensure!(root.is_dir(), "Project root must be a directory");
+            command["workspaceRoot"] = json!(root);
         }
         let result = self.store.dispatch(&command)?;
         let _ = self.changes.send(
@@ -29,7 +26,11 @@ impl Services {
                 tracing::error!(%error,"Effect worker failed");
             }
         });
-        self.tasks.lock().await.push(task);
+        {
+            let mut tasks = self.tasks.lock().await;
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
+        }
         Ok(result)
     }
 
@@ -37,16 +38,14 @@ impl Services {
         let _serialized = self.effects.lock().await;
         while let Some((id, thread_id, command)) = self.store.claim_effect()? {
             if let Err(error) = self.deliver_prompt(&thread_id, &command).await {
-                self.store.agent_event(
+                let change = self.store.agent_event(
                     &thread_id,
                     &json!({"type":"acp.failure","message":error.to_string()}),
                     None,
                     true,
                     Some(&error.to_string()),
                 )?;
-                let _ = self
-                    .changes
-                    .send(json!({"type":"changed","threadId":thread_id}));
+                let _ = self.changes.send(change);
             }
             self.store.complete_effect(id)?;
         }
@@ -97,7 +96,11 @@ impl Services {
                 }
                 services.sessions.lock().await.remove(&thread_id);
             });
-            self.tasks.lock().await.push(task);
+            {
+                let mut tasks = self.tasks.lock().await;
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
+            }
             session
         };
         drop(sessions);
@@ -106,6 +109,18 @@ impl Services {
 
     async fn record_agent_event(&self, thread_id: &str, event: AgentEvent) -> Result<()> {
         let (event, text, finished, failure) = match event {
+            AgentEvent::AuthenticationRequired(methods) => (
+                json!({"type":"acp.authentication.required","methods":methods}),
+                None,
+                false,
+                None,
+            ),
+            AgentEvent::Configuration(data) => (
+                json!({"type":"acp.configuration","data":data}),
+                None,
+                false,
+                None,
+            ),
             AgentEvent::Ready(data) => (json!({"type":"acp.ready","data":data}), None, false, None),
             AgentEvent::Update(data) => {
                 let text = if data["update"]["sessionUpdate"] == "agent_message_chunk" {
@@ -136,16 +151,14 @@ impl Services {
                 Some(error),
             ),
         };
-        self.store.agent_event(
+        let change = self.store.agent_event(
             thread_id,
             &event,
             text.as_deref(),
             finished,
             failure.as_deref(),
         )?;
-        let _ = self.changes.send(
-            json!({"type":"changed","threadId":thread_id,"agentEvent":event,"updatedAt":now()}),
-        );
+        let _ = self.changes.send(change);
         Ok(())
     }
 
@@ -158,6 +171,47 @@ impl Services {
             .cloned()
             .context("Agent session is not running")?;
         session.send(SessionCommand::Cancel).await
+    }
+
+    pub(crate) async fn configure_agent(
+        &self,
+        thread_id: &str,
+        id: String,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        let thread = self.store.thread(thread_id)?;
+        ensure!(
+            thread["thread"]["activeRunId"].is_null(),
+            "Wait for this turn to finish before changing agent configuration"
+        );
+        let value = if let Some(value) = value.as_bool() {
+            t3_acp::protocol::schema::v1::SessionConfigOptionValue::boolean(value)
+        } else {
+            t3_acp::protocol::schema::v1::SessionConfigOptionValue::value_id(
+                value
+                    .as_str()
+                    .context("Invalid configuration value")?
+                    .to_owned(),
+            )
+        };
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .cloned()
+            .context("Agent session is not running")?;
+        session.send(SessionCommand::Config { id, value }).await
+    }
+    pub(crate) async fn authenticate_agent(&self, thread_id: &str, method: String) -> Result<()> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .cloned()
+            .context("Agent session is not running")?;
+        session.send(SessionCommand::Authenticate(method)).await
     }
 
     pub(crate) async fn answer_permission(
@@ -173,6 +227,15 @@ impl Services {
             .get(thread_id)
             .cloned()
             .context("Agent session is not running")?;
-        session.answer_permission(id, option).await
+        session.answer_permission(id, option).await?;
+        let change = self.store.agent_event(
+            thread_id,
+            &json!({"type":"acp.permission.answered","id":id}),
+            None,
+            false,
+            None,
+        )?;
+        let _ = self.changes.send(change);
+        Ok(())
     }
 }

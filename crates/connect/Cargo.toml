@@ -18,3 +18,16 @@ tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+
+[features]
+test-support = []
+
+[[bin]]
+name = "t3-connector-fixture"
+path = "tests/fixtures/connector.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "tunnel"
+path = "tests/tunnel.rs"
+required-features = ["test-support"]

@@ -87,3 +87,86 @@ async fn loads_a_native_session_before_prompting() {
     assert_eq!(ready["sessionId"], "native-test");
     session.send(SessionCommand::Shutdown).await.unwrap();
 }
+
+#[tokio::test]
+async fn authentication_precedes_session_creation_and_preserves_the_queued_prompt() {
+    let (session, mut events) = Session::start(
+        AgentCommand::new(env!("CARGO_BIN_EXE_t3-acp-fixture")).environment(
+            std::collections::BTreeMap::from([(
+                "T3_ACP_FIXTURE_REQUIRE_AUTH".into(),
+                "true".into(),
+            )]),
+        ),
+        std::env::current_dir().unwrap(),
+        None,
+    );
+    let AgentEvent::AuthenticationRequired(methods) = next(&mut events).await else {
+        panic!("Missing authentication methods")
+    };
+    assert_eq!(methods[0]["id"], "fixture-login");
+    session
+        .prompt("queued before sign in".into())
+        .await
+        .unwrap();
+    session
+        .send(SessionCommand::Authenticate("fixture-login".into()))
+        .await
+        .unwrap();
+    assert!(matches!(next(&mut events).await, AgentEvent::Ready(_)));
+    let AgentEvent::Update(update) = next(&mut events).await else {
+        panic!("Missing queued prompt")
+    };
+    assert_eq!(update["update"]["content"]["text"], "queued before sign in");
+    assert!(matches!(next(&mut events).await, AgentEvent::Update(_)));
+    assert!(matches!(
+        next(&mut events).await,
+        AgentEvent::TurnFinished(_)
+    ));
+    session.send(SessionCommand::Shutdown).await.unwrap();
+}
+#[tokio::test]
+async fn configuration_uses_the_agents_native_option_id_and_returns_its_current_options() {
+    let (session, mut events) = start(None);
+    let _ = next(&mut events).await;
+    session
+        .send(SessionCommand::Config {
+            id: "agent-model-choice".into(),
+            value: "accurate".into(),
+        })
+        .await
+        .unwrap();
+    let AgentEvent::Configuration(configuration) = next(&mut events).await else {
+        panic!("Missing configuration result")
+    };
+    assert_eq!(
+        configuration["configOptions"][0]["id"],
+        "agent-model-choice"
+    );
+    assert_eq!(
+        configuration["configOptions"][0]["currentValue"],
+        "accurate"
+    );
+    session.send(SessionCommand::Shutdown).await.unwrap();
+}
+#[tokio::test]
+async fn cancellation_expires_pending_permission_responses() {
+    let (session, mut events) = start(None);
+    let _ = next(&mut events).await;
+    session.prompt("permission".into()).await.unwrap();
+    let AgentEvent::Permission { id, .. } = next(&mut events).await else {
+        panic!("Missing permission request")
+    };
+    session.send(SessionCommand::Cancel).await.unwrap();
+    loop {
+        if matches!(next(&mut events).await, AgentEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert!(
+        session
+            .answer_permission(&id, Some("allow".into()))
+            .await
+            .is_err()
+    );
+    session.send(SessionCommand::Shutdown).await.unwrap();
+}

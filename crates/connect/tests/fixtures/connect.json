@@ -1,0 +1,24 @@
+{
+  "relayPublicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAfGawQSHDK6fODHFc8SkG7Cvd7gCmJ1DMZ2BxxzgH+5Y=\n-----END PUBLIC KEY-----\n",
+  "relayPrivateKey": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIOGHXLbYBq5grbBXB1Y8Il3tlFmsGqG05LK+9QNrvRYx\n-----END PRIVATE KEY-----\n",
+  "relayClaims": {
+    "iss": "https://relay.fixture.test",
+    "aud": "t3-env:fixture",
+    "sub": "cloud-user",
+    "jti": "relay-jti",
+    "iat": 1800000000,
+    "exp": 1800000060,
+    "nonce": "relay-nonce",
+    "environmentId": "fixture",
+    "clientProofKeyThumbprint": "Bl17f8svfPMNrNsgjWKSDvTYIRYGKM2HqzlWTthKqC8",
+    "cnf": {
+      "jkt": "Bl17f8svfPMNrNsgjWKSDvTYIRYGKM2HqzlWTthKqC8"
+    },
+    "scope": [
+      "environment:connect"
+    ]
+  },
+  "relayProof": "eyJhbGciOiJFZERTQSIsInR5cCI6InQzLWNsb3VkLW1pbnQrand0In0.eyJpc3MiOiJodHRwczovL3JlbGF5LmZpeHR1cmUudGVzdCIsImF1ZCI6InQzLWVudjpmaXh0dXJlIiwic3ViIjoiY2xvdWQtdXNlciIsImp0aSI6InJlbGF5LWp0aSIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDYwLCJub25jZSI6InJlbGF5LW5vbmNlIiwiZW52aXJvbm1lbnRJZCI6ImZpeHR1cmUiLCJjbGllbnRQcm9vZktleVRodW1icHJpbnQiOiJCbDE3ZjhzdmZQTU5yTnNnaldLU0R2VFlJUllHS00ySHF6bFdUdGhLcUM4IiwiY25mIjp7ImprdCI6IkJsMTdmOHN2ZlBNTnJOc2dqV0tTRHZUWUlSWUdLTTJIcXpsV1R0aEtxQzgifSwic2NvcGUiOlsiZW52aXJvbm1lbnQ6Y29ubmVjdCJdfQ.VhbOdGJ48L_ctZsVpOyhWYhhNUPDYBSASTGgW53YjIxJohbGV6Ss_bbWYy8pr0qqsE7tlLU3c5Gzf75khHKWDw",
+  "dpopProof": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImRwb3Arand0IiwiandrIjp7Imt0eSI6IkVDIiwieCI6IlI0MUY4c1hsNUl1d0VLLVpKb1NiTDJtQVFESS1OSHpWd2NxMHcwaGxrTFUiLCJ5IjoiaWo0cm96dEY1VW9kNXB5WFVHX1diVERJUGdWN05KNTA1ODJUUmxWUUxpUSIsImNydiI6IlAtMjU2In19.eyJodG0iOiJHRVQiLCJodHUiOiJodHRwczovL2Vudmlyb25tZW50LmZpeHR1cmUudGVzdC9hcGkvYXV0aC9zZXNzaW9uIiwiaWF0IjoxODAwMDAwMDAwLCJqdGkiOiJjbGllbnQtanRpIiwiYXRoIjoiM3FVeXh2VmdJU2pOMGhmbFlDQ1pCc3NKTWVGR0tfNU9qVFJMXzZNV2F2SSJ9.Xa3WWeLFwWb3UwlXfLMy9KMRr5N2KKu63nBn2O-sGogv4iOeWkGrzRWAh2nFFs51ooOMKRtVnKzKnsrCHFqsgQ",
+  "thumbprint": "Bl17f8svfPMNrNsgjWKSDvTYIRYGKM2HqzlWTthKqC8"
+}

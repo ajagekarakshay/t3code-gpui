@@ -22,6 +22,15 @@ pub(crate) fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 
 impl Store {
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        // Create private before SQLite opens it; its WAL and journal inherit this mode.
+        let mut file = std::fs::OpenOptions::new();
+        file.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            file.mode(0o600);
+        }
+        file.open(path)?;
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
@@ -88,6 +97,16 @@ impl Store {
 
     pub(crate) fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
         self.lock()?.execute("INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_metadata(&self, keys: &[&str]) -> Result<()> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        for key in keys {
+            tx.execute("DELETE FROM metadata WHERE key=?", [key])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -196,7 +215,7 @@ impl Store {
                     matches!(provider, "codex" | "claude-code"),
                     "Unsupported provider"
                 );
-                let thread = json!({"id":id,"projectId":project_id,"title":required(command,"title")?,"modelSelection":command["modelSelection"],"providerInstanceId":provider,"runtimeMode":command.get("runtimeMode").cloned().unwrap_or(json!("supervised")),"interactionMode":command.get("interactionMode").cloned().unwrap_or(json!("default")),"branch":command["branch"],"worktreePath":command["worktreePath"],"createdBy":command.get("createdBy").cloned().unwrap_or(json!({"type":"user"})),"creationSource":command.get("creationSource").cloned().unwrap_or(json!("user")),"lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":id},"forkedFrom":null,"activeProviderThreadId":null,"latestRunId":null,"activeRunId":null,"status":"idle","pendingRuntimeRequest":null,"latestVisibleMessage":null,"latestUserMessageAt":null,"hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0,"createdAt":timestamp,"updatedAt":timestamp,"archivedAt":null,"settledOverride":null,"settledAt":null,"deletedAt":null});
+                let thread = json!({"id":id,"projectId":project_id,"title":required(command,"title")?,"modelSelection":command["modelSelection"],"providerInstanceId":provider,"runtimeMode":command.get("runtimeMode").cloned().unwrap_or(json!("supervised")),"interactionMode":command.get("interactionMode").cloned().unwrap_or(json!("default")),"branch":command["branch"],"worktreePath":command["worktreePath"],"createdBy":command.get("createdBy").cloned().unwrap_or(json!("user")),"creationSource":command.get("creationSource").cloned().unwrap_or(json!("server")),"lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":id},"forkedFrom":null,"activeProviderThreadId":null,"latestRunId":null,"activeRunId":null,"status":"idle","pendingRuntimeRequest":null,"latestVisibleMessage":null,"latestUserMessageAt":null,"hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0,"createdAt":timestamp,"updatedAt":timestamp,"archivedAt":null,"settledOverride":null,"settledAt":null,"deletedAt":null});
                 write_record(&tx, "threads", id, &thread)?;
                 json!({"type":"thread.updated","thread":thread})
             }
@@ -343,7 +362,7 @@ impl Store {
         text: Option<&str>,
         finished: bool,
         failure: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Value> {
         let mut connection = self.lock()?;
         let tx = connection.transaction()?;
         let mut thread = read_record(&tx, "threads", thread_id)?;
@@ -360,20 +379,53 @@ impl Store {
             let mut message = if let Some(value) = existing {
                 serde_json::from_str::<Value>(&value)?
             } else {
-                json!({"id":message_id,"threadId":thread_id,"runId":thread["latestRunId"],"nodeId":null,"role":"assistant","text":"","attachments":[],"streaming":true,"createdAt":timestamp,"updatedAt":timestamp,"createdBy":{"type":"agent"},"creationSource":"agent"})
+                json!({"id":message_id,"threadId":thread_id,"runId":thread["latestRunId"],"nodeId":null,"role":"assistant","text":"","attachments":[],"streaming":true,"createdAt":timestamp,"updatedAt":timestamp,"createdBy":"agent","creationSource":"provider"})
             };
             message["text"] = json!(format!(
                 "{}{text}",
                 message["text"].as_str().unwrap_or_default()
             ));
             message["updatedAt"] = json!(timestamp);
-            thread["latestVisibleMessage"] = json!({"id":message_id,"role":"assistant","text":message["text"],"updatedAt":timestamp});
+            thread["latestVisibleMessage"] = json!({"id":message_id,"role":"assistant","text":message["text"].as_str().unwrap_or_default().chars().take(400).collect::<String>(),"updatedAt":timestamp});
+            tx.execute("INSERT INTO messages(id,thread_id,value) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",params![message_id,thread_id,message.to_string()])?;
+        }
+        let update = &event["data"]["update"];
+        if matches!(
+            update["sessionUpdate"].as_str(),
+            Some("tool_call" | "tool_call_update")
+        ) {
+            let tool_id = required(update, "toolCallId")?;
+            let message_id = format!("tool:{}:{tool_id}", required(&thread, "latestRunId")?);
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM messages WHERE id=?",
+                    [&message_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut message = existing.map(|value|serde_json::from_str::<Value>(&value)).transpose()?.unwrap_or(json!({"id":message_id,"threadId":thread_id,"runId":thread["latestRunId"],"role":"tool","text":"","toolCall":{},"createdAt":timestamp,"updatedAt":timestamp}));
+            if let Some(fields) = update.as_object() {
+                for (key, value) in fields {
+                    if key != "sessionUpdate" {
+                        message["toolCall"][key] = value.clone();
+                    }
+                }
+            }
+            message["text"] = message["toolCall"]["title"].clone();
+            message["updatedAt"] = json!(timestamp);
             tx.execute("INSERT INTO messages(id,thread_id,value) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",params![message_id,thread_id,message.to_string()])?;
         }
         thread["status"] = json!(if failure.is_some() {
             "error"
         } else if finished {
             "idle"
+        } else if matches!(
+            event["type"].as_str(),
+            Some("acp.permission" | "acp.authentication.required")
+        ) {
+            "waiting"
+        } else if thread["activeRunId"].is_null() {
+            thread["status"].as_str().unwrap_or("idle")
         } else {
             "running"
         });
@@ -388,11 +440,41 @@ impl Store {
             thread["nativeSessionId"] = event["data"]["sessionId"].clone();
             thread["agentConfiguration"] = event["data"].clone();
         }
+        if event["type"] == "acp.authentication.required" {
+            thread["authenticationMethods"] = event["methods"].clone();
+        }
+        if event["type"] == "acp.ready" {
+            thread["authenticationMethods"] = Value::Null;
+        }
+        if event["type"] == "acp.configuration" {
+            if let Some(options) = event["data"].get("configOptions") {
+                thread["agentConfiguration"]["session"]["configOptions"] = options.clone();
+            }
+            if let Some(mode) = event["data"].get("currentModeId") {
+                thread["agentConfiguration"]["session"]["modes"]["currentModeId"] = mode.clone();
+            }
+        }
+        if event["type"] == "acp.permission" {
+            thread["pendingAcpPermission"] = event.clone();
+        }
+        if finished || event["type"] == "acp.permission.answered" {
+            thread["pendingAcpPermission"] = Value::Null;
+        }
+        if update["sessionUpdate"] == "config_option_update" {
+            thread["agentConfiguration"]["session"]["configOptions"] =
+                update["configOptions"].clone();
+        }
+        if update["sessionUpdate"] == "current_mode_update" {
+            thread["agentConfiguration"]["session"]["modes"]["currentModeId"] =
+                update["currentModeId"].clone();
+        }
         thread["updatedAt"] = json!(timestamp);
         write_record(&tx, "threads", thread_id, &thread)?;
-        append_event(&tx, Some(thread_id), None, event)?;
+        let sequence = append_event(&tx, Some(thread_id), None, event)?;
         tx.commit()?;
-        Ok(())
+        Ok(
+            json!({"type":"changed","threadId":thread_id,"thread":thread,"sequence":sequence,"agentEvent":event}),
+        )
     }
 }
 
@@ -522,6 +604,38 @@ mod tests {
             &json!({"type":"thread.unarchive","commandId":"restore","threadId":"thread"}),
         )?;
         assert_eq!(store.shell()?["threads"][0]["projectId"], "project");
+        Ok(())
+    }
+    #[test]
+    fn native_tool_updates_and_pending_permissions_survive_snapshot_reads() -> Result<()> {
+        let (_directory, store) = setup()?;
+        store.dispatch(&message())?;
+        store.agent_event("thread",&json!({"type":"acp.update","data":{"update":{"sessionUpdate":"tool_call","toolCallId":"write","title":"Edit main.rs","kind":"edit","status":"pending","rawInput":{"file":"main.rs"}}}}),None,false,None)?;
+        store.agent_event("thread",&json!({"type":"acp.permission","id":"permission","request":{"options":[{"optionId":"allow","kind":"allow_once"}]}}),None,false,None)?;
+        let waiting = store.thread("thread")?;
+        assert_eq!(waiting["thread"]["status"], "waiting");
+        assert_eq!(
+            waiting["thread"]["pendingAcpPermission"]["id"],
+            "permission"
+        );
+        store.agent_event("thread",&json!({"type":"acp.update","data":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"write","status":"completed","rawOutput":"saved"}}}),None,false,None)?;
+        store.agent_event(
+            "thread",
+            &json!({"type":"acp.turn.finished","data":{"stopReason":"end_turn"}}),
+            None,
+            true,
+            None,
+        )?;
+        let done = store.thread("thread")?;
+        let tool = &done["messages"][1]["toolCall"];
+        assert_eq!(tool["title"], "Edit main.rs");
+        assert_eq!(tool["kind"], "edit");
+        assert_eq!(tool["status"], "completed");
+        assert_eq!(tool["rawInput"]["file"], "main.rs");
+        assert_eq!(tool["rawOutput"], "saved");
+        assert_eq!(done["messages"].as_array().unwrap().len(), 2);
+        assert!(done["thread"]["pendingAcpPermission"].is_null());
+        assert_eq!(done["thread"]["status"], "idle");
         Ok(())
     }
 }

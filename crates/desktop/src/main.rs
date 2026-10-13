@@ -21,6 +21,7 @@ fn main() -> anyhow::Result<()> {
     let server = Server::open(ServerOptions::new(arguments.home_dir))?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind(arguments.listen))?;
     let address = listener.local_addr()?;
+    runtime.block_on(server.start_connect(address))?;
     let router = server.router();
     runtime.spawn(async move {
         if let Err(error) = axum::serve(listener, router).await {
@@ -28,6 +29,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
     let shutdown = server.clone();
+    let shutdown_runtime = runtime.clone();
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
         workspace::bind_keys(cx);
@@ -53,8 +55,13 @@ fn main() -> anyhow::Result<()> {
         .expect("Could not open T3 Code");
         cx.on_app_quit(move |_| {
             let server = shutdown.clone();
+            let runtime = shutdown_runtime.clone();
             async move {
-                server.shutdown().await;
+                let _ = runtime
+                    .spawn(async move {
+                        server.shutdown().await;
+                    })
+                    .await;
             }
         })
         .detach();

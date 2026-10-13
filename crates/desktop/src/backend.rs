@@ -10,6 +10,15 @@ pub(crate) enum Request {
         clear_draft: bool,
     },
     Cancel(String),
+    Configure {
+        thread: String,
+        id: String,
+        value: Value,
+    },
+    Authenticate {
+        thread: String,
+        method: String,
+    },
     Permission {
         thread: String,
         id: String,
@@ -23,12 +32,9 @@ pub(crate) enum Update {
         snapshot: Value,
         reset: bool,
     },
-    Permission {
-        thread: String,
-        event: Value,
-    },
+    Agent(Value),
     Completed {
-        clear_draft: bool,
+        submitted: Option<(String, String)>,
     },
     Failed(String),
 }
@@ -46,25 +52,30 @@ pub(crate) async fn run(server: Server, requests: Receiver<Request>, updates: Se
                 let Ok(request)=request else{break};
                 let result=match request{
                     Request::Select(id)=>{selected=Some(id.clone());match server.thread(&id){Ok(snapshot)=>{let _=updates.send(Update::Thread{id,snapshot,reset:true}).await;Ok(())},Err(error)=>Err(error)}},
-                    Request::Dispatch{command,select,clear_draft}=>match server.dispatch(command).await{
+                    Request::Dispatch{command,select,clear_draft}=>{
+                        let submitted = if clear_draft { command["threadId"].as_str().zip(command["text"].as_str()).map(|(id,text)|(id.to_owned(),text.to_owned())) } else { None };
+                        match server.dispatch(command).await{
                         Ok(_)=>{
                             if let Some(id)=select{selected=Some(id.clone());if let Ok(snapshot)=server.thread(&id){let _=updates.send(Update::Thread{id,snapshot,reset:true}).await;}}
-                            let _=updates.send(Update::Completed{clear_draft}).await;Ok(())
+                            let _=updates.send(Update::Completed{submitted}).await;Ok(())
                         },Err(error)=>Err(error)
+                        }
                     },
                     Request::Cancel(id)=>server.cancel(&id).await,
+                    Request::Configure{thread,id,value}=>server.configure_agent(&thread,id,value).await,
+                    Request::Authenticate{thread,method}=>server.authenticate_agent(&thread,method).await,
                     Request::Permission{thread,id,option}=>server.answer_permission(&thread,&id,option).await,
                 };
                 if let Err(error)=result{let _=updates.send(Update::Failed(error.to_string())).await;}
             }
             event=events.recv()=>{
                 let event=match event{Ok(event)=>event,Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>serde_json::json!({}),Err(_)=>break};
-                if let Ok(shell)=server.shell(){if updates.send(Update::Shell(shell)).await.is_err(){break;}}
-                if let Some(id)=&selected{
-                    if let Ok(snapshot)=server.thread(id){let _=updates.send(Update::Thread{id:id.clone(),snapshot,reset:false}).await;}
-                }
-                if event["agentEvent"]["type"]=="acp.permission"{
-                    if let Some(thread)=event["threadId"].as_str(){let _=updates.send(Update::Permission{thread:thread.into(),event:event["agentEvent"].clone()}).await;}
+                if !event["agentEvent"].is_null() {
+                    if updates.send(Update::Agent(event)).await.is_err(){break;}
+                } else {
+                    if let Ok(shell)=server.shell()&& updates.send(Update::Shell(shell)).await.is_err(){break;}
+                    if let Some(id)=&selected
+                        && let Ok(snapshot)=server.thread(id){let _=updates.send(Update::Thread{id:id.clone(),snapshot,reset:false}).await;}
                 }
             }
         }

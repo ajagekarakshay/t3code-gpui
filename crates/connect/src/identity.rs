@@ -44,6 +44,11 @@ impl EnvironmentIdentity {
     }
 }
 
+pub fn validate_relay_key(pem: &str) -> Result<()> {
+    VerifyingKey::from_public_key_pem(&pem.replace("\\n", "\n"))?;
+    Ok(())
+}
+
 /// Validates JOSE exactly as the existing relay does, before consuming replay guards.
 pub fn verify_relay_proof(
     pem: &str,

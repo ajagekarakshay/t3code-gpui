@@ -74,6 +74,43 @@ async fn bearer_pairing_and_effect_rpc_round_trip() -> Result<()> {
         .json()
         .await?;
     assert_eq!(snapshot["projects"][0]["title"], "Transport test");
+    socket.send(Message::Text(json!({"_tag":"Request","id":9,"tag":"orchestration.subscribeShell","payload":{},"headers":[]}).to_string().into())).await?;
+    let initial: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(initial["requestId"], 9);
+    assert_eq!(initial["_tag"], "Chunk");
+    socket.send(Message::Text(json!([
+        {"_tag":"Request","id":2,"tag":"projects.mutate","payload":{"type":"project.create","commandId":"second-command","projectId":"second-project","title":"Batched project","workspaceRoot":directory.path()},"headers":[]},
+        {"_tag":"Request","id":"unsupported","tag":"missing.method","payload":{},"headers":[]},
+        {"_tag":"Ack","requestId":9}
+    ]).to_string().into())).await?;
+    let mutation: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(mutation["requestId"], 2);
+    assert_eq!(mutation["exit"]["_tag"], "Success");
+    let failure: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(failure["requestId"], "unsupported");
+    assert!(failure["exit"]["cause"].is_array());
+    assert_eq!(failure["exit"]["cause"][0]["_tag"], "Die");
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+        .await?
+        .unwrap()?;
+    let changed: Value = serde_json::from_str(changed.to_text()?)?;
+    assert_eq!(changed["requestId"], 9);
+    assert_eq!(
+        changed["values"][0]["snapshot"]["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    socket
+        .send(Message::Text(
+            json!([{"_tag":"Interrupt","requestId":9},{"_tag":"Ping"}])
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    let pong: Value = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
+    assert_eq!(pong["_tag"], "Pong");
     socket.close(None).await?;
     task.abort();
     let _ = task.await;
