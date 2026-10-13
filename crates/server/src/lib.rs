@@ -4,6 +4,7 @@ mod auth;
 mod cloud;
 mod home;
 mod http;
+mod relay_client;
 mod store;
 mod workspace;
 

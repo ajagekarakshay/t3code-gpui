@@ -57,6 +57,7 @@ pub(crate) struct CloudState {
     generation: u64,
     status: Value,
     restart_delay: u64,
+    installing: bool,
 }
 impl CloudState {
     pub(crate) fn new(home: PathBuf) -> Self {
@@ -68,6 +69,7 @@ impl CloudState {
             generation: 0,
             status: json!({"status":"disabled"}),
             restart_delay: 1,
+            installing: false,
         }
     }
     pub(crate) async fn stop(&mut self) {
@@ -171,7 +173,7 @@ impl Services {
         {
             self.retry_registration(cloud.generation).await;
         }
-        if cloud.status["status"] == "failed" {
+        if cloud.status["status"] == "failed" && !cloud.installing {
             return Err(ConnectError::Unavailable(cloud.status.clone()).into());
         }
         Ok(json!({"ok":true,"endpointRuntimeStatus":cloud.status}))
@@ -467,12 +469,51 @@ impl Services {
                     json!({"status":"unsupported","providerKind":configuration.provider_kind()});
                 return;
             }
-            let executable = resolve_cloudflared(&cloud.home).await;
+            let executable = crate::relay_client::resolve_existing(&cloud.home).await;
             let Some(executable) = executable else {
                 cloud.status = runtime_status(
                     configuration,
-                    json!({"status":"failed","failure":"not-installed","reason":"The relay client is not installed."}),
+                    json!({"status":"failed","failure":"not-installed","reason":"Installing the relay client."}),
                 );
+                if !cloud.installing {
+                    cloud.installing = true;
+                    let services = Arc::downgrade(self);
+                    let home = cloud.home.clone();
+                    let task = tokio::spawn(async move {
+                        let installed = crate::relay_client::resolve_or_install(&home).await;
+                        let Some(services) = services.upgrade() else {
+                            return;
+                        };
+                        let mut cloud = services.cloud.lock().await;
+                        cloud.installing = false;
+                        let Some(configuration) = cloud.configuration.clone() else {
+                            cloud.status = json!({"status":"disabled"});
+                            return;
+                        };
+                        match installed {
+                            Ok(_) => {
+                                services
+                                    .activate_tunnel(&mut cloud, Some(&configuration), true)
+                                    .await;
+                            }
+                            Err(error) => {
+                                cloud.status = if configuration.provider_kind()
+                                    == "cloudflare_tunnel"
+                                {
+                                    runtime_status(
+                                        &configuration,
+                                        json!({"status":"failed","failure":"not-installed","reason":error.to_string()}),
+                                    )
+                                } else {
+                                    json!({"status":"unsupported","providerKind":configuration.provider_kind()})
+                                };
+                            }
+                        }
+                    });
+                    let mut tasks = self.tasks.lock().await;
+                    tasks.retain(|task| !task.is_finished());
+                    tasks.push(task);
+                }
                 return;
             };
             match Tunnel::start(&executable, configuration) {
@@ -598,62 +639,6 @@ async fn monitor_tunnel(
         }
     }
 }
-async fn resolve_cloudflared(home: &std::path::Path) -> Option<PathBuf> {
-    let binary = if cfg!(windows) {
-        "cloudflared.exe"
-    } else {
-        "cloudflared"
-    };
-    let platform = match std::env::consts::OS {
-        "macos" => "darwin",
-        "windows" => "win32",
-        other => other,
-    };
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        other => other,
-    };
-    let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("T3CODE_CLOUDFLARED_PATH") {
-        candidates.push(PathBuf::from(path));
-    }
-    candidates.push(
-        home.join("tools/cloudflared/2026.10.0")
-            .join(format!("{platform}-{arch}"))
-            .join(binary),
-    );
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|p| p.join(binary)));
-    }
-    for path in candidates {
-        if !path.is_file() {
-            continue;
-        }
-        let output = tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::process::Command::new(&path)
-                .arg("version")
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-        if let Ok(Ok(output)) = output {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let version = text
-                .split_whitespace()
-                .find(|part| part.split('.').count() == 3);
-            if let Some(version) = version {
-                let pieces: Vec<u32> = version.split('.').filter_map(|v| v.parse().ok()).collect();
-                if pieces.len() == 3 && pieces.as_slice() >= [2025, 6, 1].as_slice() {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

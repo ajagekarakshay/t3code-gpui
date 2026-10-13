@@ -21,6 +21,8 @@ Add a project directory, create a thread, and send a prompt. The desktop runs it
 
 Settings can pair another native environment from a direct or hosted T3 pairing link. Sessions are proof-bound to the desktop, stored in the operating system credential store, and reconnect automatically. The desktop resumes from committed event sequence numbers so reconnecting does not drop streamed agent updates.
 
+When a managed T3 Connect tunnel is linked, the Rust server uses a compatible `cloudflared` from `T3CODE_CLOUDFLARED_PATH` or `PATH`. On a clean machine it downloads the pinned release for the platform, verifies its SHA-256 checksum, validates the reported version, and activates it atomically under the Rust data directory.
+
 The standalone development server is also available:
 
 ```sh
